@@ -1,0 +1,4 @@
+# Xray Core Binary Placeholder
+# This file serves as a placeholder for the Xray executable binary.
+# Replace this file with the compiled binary corresponding to your target CPU architecture.
+# For Android, you would typically bundle architecture-specific binaries or load them dynamically.

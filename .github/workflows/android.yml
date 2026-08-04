@@ -1,0 +1,73 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ──────────────────────────────────────────────
+      # مرحله ۱: پاک کردن تمام کش‌ها
+      # ──────────────────────────────────────────────
+      - name: Clear GitHub Actions cache
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== پاک کردن کش GitHub Actions ==="
+          gh actions-cache delete --all --confirm || echo "No caches to delete"
+          echo "=== done ==="
+
+      - name: Clear local build caches
+        run: |
+          echo "=== پاک کردن کش‌های محلی ==="
+          rm -rf app/build/.cxx
+          rm -rf app/build/.externalNativeBuild
+          rm -rf app/build
+          rm -rf build
+          rm -rf .gradle
+          rm -rf ~/.gradle/caches
+          echo "=== done ==="
+
+      # ──────────────────────────────────────────────
+      # مرحله ۲: بیلد
+      # ──────────────────────────────────────────────
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Create debug keystore
+        run: |
+          mkdir -p ~/.android
+          keytool -genkeypair \
+            -alias androiddebugkey \
+            -keypass android \
+            -keystore ~/.android/debug.keystore \
+            -storepass android \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2ray-app-debug
+          path: app/build/outputs/apk/debug/*.apk

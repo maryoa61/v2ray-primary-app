@@ -1,0 +1,19 @@
+# Set default behavior to automatic text line ending normalization.
+* text=auto
+
+# Declare files that will always have LF line endings on checkout.
+gradlew text eol=lf
+*.sh text eol=lf
+
+# Declare files that will always have CRLF line endings on checkout.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Denote binary files (no line ending normalization should be applied).
+gradle/wrapper/gradle-wrapper.jar binary
+*.jar binary
+*.png binary
+*.jpg binary
+*.webp binary
+*.gif binary
+*.so binary
