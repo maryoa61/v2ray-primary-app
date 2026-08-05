@@ -100,14 +100,13 @@ class V2RayVpnService : VpnService() {
             try {
                 repository.log("TUNNEL", "INFO", "Allocating local tun0 interface file descriptor...")
 
-                // تغییر ۱: MTU روی 1400 تنظیم شد تا از Fragmentation جلوگیری شود
+                // تغییرات اعمال شده: MTU و DNS لوکال
                 val builder = Builder()
                     .setSession("V2RayDan")
                     .addAddress("172.19.0.1", 30) 
                     .addRoute("0.0.0.0", 0)       
-                    .addDnsServer("8.8.8.8")      
-                    .addDnsServer("8.8.8.8")      
-                    .setMtu(1400) // بهینه‌سازی برای شبکه‌های موبایل و اورهد تونل
+                    .addDnsServer("127.0.0.1") // هدایت تمام درخواست‌های DNS گوشی به سمت Xray برای جلوگیری از DNS Leak
+                    .setMtu(HevSocks5Tunnel.TUNNEL_MTU) // استفاده از ثابت 1400 برای جلوگیری از Fragmentation
 
                 try {
                     builder.addDisallowedApplication(packageName)
@@ -237,7 +236,7 @@ class V2RayVpnService : VpnService() {
                     repository.log("XRAY-CORE", "ERROR", "Core exited code: $exitCode.")
                     performCleanup(repository)
                     
-                    // تغییر ۲: منطق Reconnect در صورت قطعی غیرارادی
+                    // منطق Reconnect در صورت قطعی غیرارادی
                     if (!isManualStop) {
                         repository.log("VPN", "WARNING", "Connection lost. Attempting to reconnect in 3 seconds...")
                         withContext(Dispatchers.Main) {
@@ -356,7 +355,7 @@ class V2RayVpnService : VpnService() {
         }
     }
 
-    // تغییر ۳: حذف runBlocking خطرناک برای جلوگیری از ANR
+    // حذف runBlocking خطرناک برای جلوگیری از ANR
     override fun onDestroy() {
         serviceScope.launch {
             performCleanup()
