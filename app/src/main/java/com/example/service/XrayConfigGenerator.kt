@@ -7,7 +7,6 @@ object XrayConfigGenerator {
 
     const val SOCKS_INBOUND_PORT = 10808
     const val HTTP_INBOUND_PORT = 10809
-    const val DNS_INBOUND_PORT = 10810 // پورت جدید برای هندل کردن DNS
 
     fun generate(server: ServerEntity, filesDir: File? = null): String {
         val outbounds = when (server.type.uppercase()) {
@@ -20,7 +19,6 @@ object XrayConfigGenerator {
 
         val hasGeoip = filesDir != null && File(filesDir, "geoip.dat").exists()
 
-        // تغییرات عمده در بخش Routing برای جلوگیری از DNS Leak و دور زدن سایت‌های ایرانی
         val routingRules = """
           "dns": {
             "servers": [
@@ -35,11 +33,6 @@ object XrayConfigGenerator {
           "routing": {
             "domainStrategy": "AsIs",
             "rules": [
-              {
-                "type": "field",
-                "inboundTag": ["dns-in"],
-                "outboundTag": "dns-out"
-              },
               {
                 "type": "field",
                 "outboundTag": "direct",
@@ -102,18 +95,6 @@ object XrayConfigGenerator {
                 "enabled": true,
                 "destOverride": ["http", "tls", "quic"]
               }
-            },
-            {
-              "tag": "dns-in",
-              "port": $DNS_INBOUND_PORT,
-              "listen": "127.0.0.1",
-              "protocol": "dokodemo-door",
-              "settings": {
-                "address": "1.1.1.1",
-                "port": 53,
-                "network": "udp",
-                "followRedirect": true
-              }
             }
           ],
           "outbounds": [
@@ -122,11 +103,6 @@ object XrayConfigGenerator {
               "protocol": "freedom",
               "settings": {},
               "tag": "direct"
-            },
-            {
-              "protocol": "dns",
-              "settings": {},
-              "tag": "dns-out"
             }
           ]
         }
@@ -272,7 +248,6 @@ object XrayConfigGenerator {
             }
             server.tls -> {
                 val sniToUse = server.sni.ifEmpty { server.address }
-                // تغییر: allowInsecure روی false قرار داده شد تا از کرش های احتمالی و مشکلات امنیتی جلوگیری شود
                 """
                 "tlsSettings": {
                   "serverName": "$sniToUse",
