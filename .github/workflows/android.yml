@@ -63,8 +63,8 @@ jobs:
             -keysize 2048 \
             -validity 10000
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug
+      - name: Build Debug APK with Clean
+        run: ./gradlew clean assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
