@@ -5,11 +5,13 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.example.MainActivity
 import com.example.data.V2RayDatabase
 import com.example.data.V2RayRepository
@@ -34,8 +36,6 @@ class V2RayVpnService : VpnService() {
 
     private val cleanupMutex = Mutex()
     private val cleanupDone = AtomicBoolean(false)
-    
-    private var isManualStop = false
 
     companion object {
         const val ACTION_START = "com.example.service.START"
@@ -47,10 +47,8 @@ class V2RayVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         if (action == ACTION_START) {
-            isManualStop = false
             startVpn()
         } else if (action == ACTION_STOP) {
-            isManualStop = true
             stopVpn()
         }
         return START_NOT_STICKY
@@ -58,16 +56,14 @@ class V2RayVpnService : VpnService() {
 
     private fun startVpn() {
         cleanupDone.set(false)
-
         createNotificationChannel()
+        
         val intent = Intent(this, MainActivity::class.java)
-
         val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
-
         val pendingIntent = PendingIntent.getActivity(this, 0, intent, pendingIntentFlags)
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -78,7 +74,13 @@ class V2RayVpnService : VpnService() {
             .setOngoing(true)
             .build()
 
-        startForeground(NOTIFICATION_ID, notification)
+        // اصلاح برای اندروید ۱۴: ذکر نوع سرویس برای جلوگیری از کرش
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        } else {
+            0
+        }
+        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
 
         serviceScope.launch {
             val db = V2RayDatabase.getDatabase(applicationContext)
@@ -87,9 +89,7 @@ class V2RayVpnService : VpnService() {
 
             if (server == null) {
                 repository.log("VPN", "ERROR", "Cannot start VPN: No active server selected.")
-                withContext(Dispatchers.Main) {
-                    VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
-                }
+                withContext(Dispatchers.Main) { VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR) }
                 stopSelf()
                 return@launch
             }
@@ -97,8 +97,6 @@ class V2RayVpnService : VpnService() {
             repository.log("VPN", "INFO", "Connecting to node: ${server.name} (${server.address}:${server.port})")
 
             try {
-                repository.log("TUNNEL", "INFO", "Allocating local tun0 interface file descriptor...")
-
                 val builder = Builder()
                     .setSession("V2RayDan")
                     .addAddress("172.19.0.1", 30) 
@@ -109,22 +107,21 @@ class V2RayVpnService : VpnService() {
 
                 try {
                     builder.addDisallowedApplication(packageName)
-                    repository.log("TUNNEL", "INFO", "Bypassed package: $packageName")
                 } catch (e: Exception) {
                     repository.log("TUNNEL", "WARNING", "Exclusion failed: ${e.localizedMessage}")
                 }
 
                 interfaceDescriptor = builder.establish()
-                if (interfaceDescriptor != null) {
-                    repository.log("TUNNEL", "SUCCESS", "Tun interface established.")
-                } else {
+                if (interfaceDescriptor == null) {
                     repository.log("TUNNEL", "ERROR", "VpnService.Builder returned null Interface.")
+                    withContext(Dispatchers.Main) { VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR) }
+                    stopSelf() // توقف سرویس در صورت خطا
+                    return@launch
                 }
+                repository.log("TUNNEL", "SUCCESS", "Tun interface established.")
             } catch (e: Exception) {
                 repository.log("TUNNEL", "ERROR", "Tunnel build failed: ${e.localizedMessage}")
-                withContext(Dispatchers.Main) {
-                    VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
-                }
+                withContext(Dispatchers.Main) { VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR) }
                 stopSelf()
                 return@launch
             }
@@ -135,11 +132,7 @@ class V2RayVpnService : VpnService() {
                 listOf("geoip.dat", "geosite.dat").forEach { filename ->
                     val destFile = File(filesDir, filename)
                     if (!destFile.exists() || destFile.length() == 0L) {
-                        assets.open(filename).use { input ->
-                            destFile.outputStream().use { output ->
-                                input.copyTo(output)
-                            }
-                        }
+                        assets.open(filename).use { input -> destFile.outputStream().use { output -> input.copyTo(output) } }
                     }
                 }
             } catch (e: Exception) {
@@ -148,32 +141,21 @@ class V2RayVpnService : VpnService() {
 
             val configJson = XrayConfigGenerator.generate(server, filesDir)
             val configFile = File(cacheDir, "xray_config.json")
-            try {
-                configFile.writeText(configJson)
-            } catch (e: Exception) {
-                repository.log("CONFIG", "ERROR", "Failed to cache configuration: ${e.localizedMessage}")
-            }
+            try { configFile.writeText(configJson) } catch (e: Exception) { repository.log("CONFIG", "ERROR", "Failed to cache configuration: ${e.localizedMessage}") }
 
             val binary = locateCoreBinary(applicationContext, repository)
             if (binary == null || !binary.exists()) {
                 repository.log("XRAY-CORE", "ERROR", "Binary execute target missing.")
-                withContext(Dispatchers.Main) {
-                    VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
-                }
+                withContext(Dispatchers.Main) { VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR) }
                 stopSelf()
                 return@launch
             }
 
             try {
                 val commandList = mutableListOf(binary.absolutePath, "-config", configFile.absolutePath)
-
-                val processBuilder = ProcessBuilder()
-                    .command(commandList)
-                    .redirectErrorStream(true)
-
+                val processBuilder = ProcessBuilder().command(commandList).redirectErrorStream(true)
                 processBuilder.environment()["XRAY_LOCATION_ASSET"] = filesDir.absolutePath
                 processBuilder.environment()["V2RAY_LOCATION_ASSET"] = filesDir.absolutePath
-
                 xrayProcess = processBuilder.start()
 
                 withContext(Dispatchers.Main) {
@@ -200,9 +182,7 @@ class V2RayVpnService : VpnService() {
                 val socksReady = waitForSocksReady(XrayConfigGenerator.SOCKS_INBOUND_PORT)
                 if (!socksReady) {
                     repository.log("XRAY-CORE", "ERROR", "SOCKS5 port handshake timeout.")
-                    withContext(Dispatchers.Main) {
-                        VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
-                    }
+                    withContext(Dispatchers.Main) { VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR) }
                     logJob.cancel()
                     performCleanup(repository)
                     stopSelf()
@@ -212,51 +192,30 @@ class V2RayVpnService : VpnService() {
                 if (fdNum != -1) {
                     val hevConfigFile = File(cacheDir, "hev_tunnel.yml")
                     HevSocks5Tunnel.writeConfig(hevConfigFile, XrayConfigGenerator.SOCKS_INBOUND_PORT)
-
                     hevTunnelThread = Thread({
                         val exitCode = HevSocks5Tunnel.start(hevConfigFile.absolutePath, fdNum)
-                        serviceScope.launch {
-                            repository.log("HEV-TUNNEL", if (exitCode == 0) "INFO" else "ERROR", "hev loop status: $exitCode.")
-                        }
-                    }, "hev-socks5-tunnel").apply {
-                        isDaemon = true
-                        start()
-                    }
+                        serviceScope.launch { repository.log("HEV-TUNNEL", if (exitCode == 0) "INFO" else "ERROR", "hev loop status: $exitCode.") }
+                    }, "hev-socks5-tunnel").apply { isDaemon = true; start() }
                 }
 
-                val exitCode = try {
-                    xrayProcess?.waitFor()
-                } catch (e: Exception) {
-                    null
-                }
+                val exitCode = try { xrayProcess?.waitFor() } catch (e: Exception) { null }
                 logJob.cancel()
 
                 if (coroutineContext.isActive) {
                     repository.log("XRAY-CORE", "ERROR", "Core exited code: $exitCode.")
                     performCleanup(repository)
-                    
-                    if (!isManualStop) {
-                        repository.log("VPN", "WARNING", "Connection lost. Attempting to reconnect in 3 seconds...")
-                        withContext(Dispatchers.Main) {
-                            VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.CONNECTING)
-                        }
-                        delay(3000)
-                        if (!isManualStop) startVpn()
-                        return@launch
-                    }
-
                     withContext(Dispatchers.Main) {
                         VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
                         VpnCoreManager.activeVpnCoreManager?.setConnectedServer(null)
                         VpnCoreManager.activeVpnCoreManager?.stopTracking()
                     }
+                    stopSelf() // توقف سرویس هنگام خروج غیرمنتظره Xray
                 }
             } catch (e: Throwable) {
                 repository.log("XRAY-CORE", "ERROR", "Exception execution: ${e.localizedMessage ?: e.toString()}")
                 performCleanup(repository)
-                withContext(Dispatchers.Main) {
-                    VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
-                }
+                withContext(Dispatchers.Main) { VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR) }
+                stopSelf()
             }
         }
     }
@@ -265,13 +224,8 @@ class V2RayVpnService : VpnService() {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             try {
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress("127.0.0.1", port), 300)
-                    return true
-                }
-            } catch (e: Exception) {
-                delay(150)
-            }
+                Socket().use { socket -> socket.connect(InetSocketAddress("127.0.0.1", port), 300); return true }
+            } catch (e: Exception) { delay(150) }
         }
         return false
     }
@@ -283,80 +237,42 @@ class V2RayVpnService : VpnService() {
             if (nativeBinary.exists() && nativeBinary.length() > 1_000_000) {
                 repository.log("SYSTEM", "SUCCESS", "Located library path: ${nativeBinary.absolutePath}")
                 nativeBinary
-            } else {
-                null
-            }
+            } else { null }
         }
     }
 
     private suspend fun performCleanup(repository: V2RayRepository? = null) {
         cleanupMutex.withLock {
-            if (cleanupDone.getAndSet(true)) {
-                return@withLock
-            }
-
-            try {
-                HevSocks5Tunnel.stop()
-                hevTunnelThread?.join(2000)
-            } catch (e: Exception) {
-                Log.e("TUNNEL", "Stop error: ${e.localizedMessage}")
-                repository?.log("TUNNEL", "ERROR", "Stop error: ${e.localizedMessage}")
-            } finally {
-                hevTunnelThread = null
-            }
-
-            try {
-                xrayProcess?.destroy()
-            } catch (e: Exception) {
-                Log.e("CORE", "Destroy error: ${e.localizedMessage}")
-                repository?.log("CORE", "ERROR", "Destroy error: ${e.localizedMessage}")
-            } finally {
-                xrayProcess = null
-            }
-
-            try {
-                interfaceDescriptor?.close()
-            } catch (e: Exception) {
-                Log.e("INTERFACE", "Close error: ${e.localizedMessage}")
-                repository?.log("INTERFACE", "ERROR", "Close error: ${e.localizedMessage}")
-            } finally {
-                interfaceDescriptor = null
-            }
+            if (cleanupDone.getAndSet(true)) return@withLock
+            try { HevSocks5Tunnel.stop(); hevTunnelThread?.join(2000) } catch (e: Exception) { Log.e("TUNNEL", "Stop error: ${e.localizedMessage}") } finally { hevTunnelThread = null }
+            try { xrayProcess?.destroy() } catch (e: Exception) { Log.e("CORE", "Destroy error: ${e.localizedMessage}") } finally { xrayProcess = null }
+            try { interfaceDescriptor?.close() } catch (e: Exception) { Log.e("INTERFACE", "Close error: ${e.localizedMessage}") } finally { interfaceDescriptor = null }
         }
     }
 
     private fun stopVpn() {
-        isManualStop = true
         serviceScope.launch {
             val db = V2RayDatabase.getDatabase(applicationContext)
             val repository = V2RayRepository(db)
-
             performCleanup(repository)
-
             withContext(Dispatchers.Main) {
                 VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.DISCONNECTED)
                 VpnCoreManager.activeVpnCoreManager?.setConnectedServer(null)
                 VpnCoreManager.activeVpnCoreManager?.stopTracking()
             }
+            stopSelf() // توقف کامل سرویس پس از قطع دستی
         }
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                CHANNEL_ID,
-                "V2Ray Dan System Status Channel",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(serviceChannel)
+            val serviceChannel = NotificationChannel(CHANNEL_ID, "V2Ray Dan System Status Channel", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(serviceChannel)
         }
     }
 
     override fun onDestroy() {
-        serviceScope.launch {
-            performCleanup()
-        }
+        try { HevSocks5Tunnel.stop(); xrayProcess?.destroy(); interfaceDescriptor?.close() } catch (e: Exception) { Log.e("VPN", "Destroy cleanup error: ${e.message}") }
         serviceJob.cancel()
         super.onDestroy()
     }
