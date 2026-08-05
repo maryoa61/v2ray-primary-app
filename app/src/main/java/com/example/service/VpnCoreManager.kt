@@ -29,8 +29,10 @@ data class SpeedState(
 
 class VpnCoreManager(private val context: Context, private val repository: V2RayRepository) {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    
+
     init {
+        // جلوگیری از ایجاد چندین نمونه همزمان که باعث کرش می‌شود
+        activeVpnCoreManager?.cleanUp()
         activeVpnCoreManager = this
     }
 
@@ -44,7 +46,7 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
     private val _speedState = MutableStateFlow(SpeedState())
     val speedState: StateFlow<SpeedState> = _speedState.asStateFlow()
 
-    private val _connectionDuration = MutableStateFlow(0L) // in seconds
+    private val _connectionDuration = MutableStateFlow(0L)
     val connectionDuration: StateFlow<Long> = _connectionDuration.asStateFlow()
 
     private val _connectedServer = MutableStateFlow<ServerEntity?>(null)
@@ -53,17 +55,7 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
     private var trafficJob: Job? = null
     private var durationJob: Job? = null
 
-    // When the user/scheduler asks to switch to a new server while the tunnel is
-    // still connected or in the middle of stopping, we can't start the next
-    // session right away (per-VpnService teardown happens asynchronously on the
-    // service side). Instead we remember the target here and auto-start once the
-    // state actually reaches DISCONNECTED. Without this, toggleVpn() during a
-    // DISCONNECTING state would just call stopVpn() again and never reconnect.
     private var pendingServer: ServerEntity? = null
-
-    // The server the tunnel is being torn down from. The service nulls
-    // _connectedServer during teardown, so this snapshot lets the DISCONNECTING
-    // handler still tell a "real switch" from a plain stop/toggle.
     private var disconnectingServer: ServerEntity? = null
 
     init {
@@ -85,9 +77,7 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
         when {
             state == VpnState.DISCONNECTED || state == VpnState.ERROR -> {
                 if (server == null) {
-                    scope.launch {
-                        repository.log("VPN", "ERROR", "Cannot start VPN: No server selected.")
-                    }
+                    scope.launch { repository.log("VPN", "ERROR", "Cannot start VPN: No server selected.") }
                     _vpnState.value = VpnState.ERROR
                     return
                 }
@@ -95,10 +85,8 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
             }
             state == VpnState.CONNECTED || state == VpnState.CONNECTING -> {
                 if (server != null && server.id == _connectedServer.value?.id) {
-                    // Already connected/targeting this server: toggle means stop.
                     stopVpn()
                 } else if (server != null) {
-                    // Switching to a different server -> stop current and reconnect.
                     pendingServer = server
                     stopVpnInternal(clearPending = false)
                 } else {
@@ -107,12 +95,8 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
             }
             state == VpnState.DISCONNECTING -> {
                 if (server != null && server.id != disconnectingServer?.id) {
-                    // A genuine switch is queued while a stop is in flight:
-                    // reconnect once the teardown finishes.
                     pendingServer = server
                 } else {
-                    // Same server (or none) while stopping == user just wants the
-                    // VPN off. Cancel any queued reconnect.
                     pendingServer = null
                 }
             }
@@ -125,7 +109,6 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
         disconnectingServer = null
         _connectionDuration.value = 0L
 
-        // Trigger real foreground service
         try {
             val intent = Intent(context, V2RayVpnService::class.java).apply {
                 action = V2RayVpnService.ACTION_START
@@ -136,9 +119,7 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
                 context.startService(intent)
             }
         } catch (e: Exception) {
-            scope.launch {
-                repository.log("VPN-SERVICE", "ERROR", "Failed to start real VPN service: ${e.localizedMessage}")
-            }
+            scope.launch { repository.log("VPN-SERVICE", "ERROR", "Failed to start real VPN service: ${e.localizedMessage}") }
             _vpnState.value = VpnState.ERROR
         }
     }
@@ -151,17 +132,11 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
         if (_vpnState.value == VpnState.DISCONNECTED) return
         disconnectingServer = _connectedServer.value
         _vpnState.value = VpnState.DISCONNECTING
-        // A user-initiated stop cancels any queued auto-reconnect; a stop that is
-        // part of a server switch (clearPending = false) keeps the parked server.
         if (clearPending) {
             pendingServer = null
         }
         stopTracking()
 
-        // Terminate foreground service. On Android O+ a background app cannot use
-        // startService() to send a command to a (still) running service — it
-        // throws IllegalStateException and the STOP never arrives, leaving the
-        // tunnel up. startForegroundService() is the safe lever here.
         try {
             val intent = Intent(context, V2RayVpnService::class.java).apply {
                 action = V2RayVpnService.ACTION_STOP
@@ -172,9 +147,7 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
                 context.startService(intent)
             }
         } catch (e: Exception) {
-            scope.launch {
-                repository.log("VPN-SERVICE", "ERROR", "Failed to issue shutdown command: ${e.localizedMessage}")
-            }
+            scope.launch { repository.log("VPN-SERVICE", "ERROR", "Failed to issue shutdown command: ${e.localizedMessage}") }
         }
     }
 
@@ -189,7 +162,6 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
     fun startTracking() {
         stopTracking()
 
-        // 1. Durational tracking loop
         durationJob = scope.launch {
             while (isActive) {
                 delay(1000)
@@ -197,7 +169,6 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
             }
         }
 
-        // 2. Real byte flow query using TrafficStats
         trafficJob = scope.launch {
             val uid = context.applicationInfo.uid
             var lastRxBytes = TrafficStats.getUidRxBytes(uid)
@@ -242,14 +213,8 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
 
     private fun formatSpeed(bytesPerSec: Long): String {
         return when {
-            bytesPerSec >= 1_000_000 -> {
-                val mbs = bytesPerSec.toDouble() / 1_000_000.0
-                String.format(Locale.US, "%.1f MB/s", mbs)
-            }
-            bytesPerSec >= 1_000 -> {
-                val kbs = bytesPerSec.toDouble() / 1_000.0
-                String.format(Locale.US, "%.1f KB/s", kbs)
-            }
+            bytesPerSec >= 1_000_000 -> String.format(Locale.US, "%.1f MB/s", bytesPerSec.toDouble() / 1_000_000.0)
+            bytesPerSec >= 1_000 -> String.format(Locale.US, "%.1f KB/s", bytesPerSec.toDouble() / 1_000.0)
             else -> "$bytesPerSec B/s"
         }
     }
