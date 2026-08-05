@@ -35,7 +35,6 @@ class V2RayVpnService : VpnService() {
     private val cleanupMutex = Mutex()
     private val cleanupDone = AtomicBoolean(false)
     
-    // برای جلوگیری از Reconnect بی‌نهایت در صورت قطعی پشت سر هم
     private var isManualStop = false
 
     companion object {
@@ -100,13 +99,13 @@ class V2RayVpnService : VpnService() {
             try {
                 repository.log("TUNNEL", "INFO", "Allocating local tun0 interface file descriptor...")
 
-                // تغییرات اعمال شده: MTU و DNS لوکال
                 val builder = Builder()
                     .setSession("V2RayDan")
                     .addAddress("172.19.0.1", 30) 
                     .addRoute("0.0.0.0", 0)       
-                    .addDnsServer("127.0.0.1") // هدایت تمام درخواست‌های DNS گوشی به سمت Xray برای جلوگیری از DNS Leak
-                    .setMtu(HevSocks5Tunnel.TUNNEL_MTU) // استفاده از ثابت 1400 برای جلوگیری از Fragmentation
+                    .addDnsServer("1.1.1.1")      
+                    .addDnsServer("8.8.8.8")      
+                    .setMtu(HevSocks5Tunnel.TUNNEL_MTU)
 
                 try {
                     builder.addDisallowedApplication(packageName)
@@ -236,14 +235,13 @@ class V2RayVpnService : VpnService() {
                     repository.log("XRAY-CORE", "ERROR", "Core exited code: $exitCode.")
                     performCleanup(repository)
                     
-                    // منطق Reconnect در صورت قطعی غیرارادی
                     if (!isManualStop) {
                         repository.log("VPN", "WARNING", "Connection lost. Attempting to reconnect in 3 seconds...")
                         withContext(Dispatchers.Main) {
-                            VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.CONNECTING) // وضعیت در حال اتصال مجدد
+                            VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.CONNECTING)
                         }
-                        delay(3000) // صبر ۳ ثانیه ای قبل از اتصال مجدد
-                        if (!isManualStop) startVpn() // فراخوانی مجدد
+                        delay(3000)
+                        if (!isManualStop) startVpn()
                         return@launch
                     }
 
@@ -355,12 +353,11 @@ class V2RayVpnService : VpnService() {
         }
     }
 
-    // حذف runBlocking خطرناک برای جلوگیری از ANR
     override fun onDestroy() {
         serviceScope.launch {
             performCleanup()
         }
-        serviceJob.cancel() // لغو تمام کوروتین‌ها
+        serviceJob.cancel()
         super.onDestroy()
     }
 }
