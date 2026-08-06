@@ -17,8 +17,6 @@ import com.example.data.V2RayDatabase
 import com.example.data.V2RayRepository
 import com.example.data.ServerEntity
 import kotlinx.coroutines.*
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -34,7 +32,7 @@ class V2RayVpnService : VpnService() {
     private val serviceJob = Job()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
-    private val cleanupMutex = Mutex()
+    private val cleanupLock = Any()
     private val cleanupDone = AtomicBoolean(false)
 
     companion object {
@@ -74,7 +72,6 @@ class V2RayVpnService : VpnService() {
             .setOngoing(true)
             .build()
 
-        // اصلاح برای اندروید ۱۴: ذکر نوع سرویس برای جلوگیری از کرش
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
         } else {
@@ -115,7 +112,7 @@ class V2RayVpnService : VpnService() {
                 if (interfaceDescriptor == null) {
                     repository.log("TUNNEL", "ERROR", "VpnService.Builder returned null Interface.")
                     withContext(Dispatchers.Main) { VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR) }
-                    stopSelf() // توقف سرویس در صورت خطا
+                    stopSelf()
                     return@launch
                 }
                 repository.log("TUNNEL", "SUCCESS", "Tun interface established.")
@@ -209,7 +206,7 @@ class V2RayVpnService : VpnService() {
                         VpnCoreManager.activeVpnCoreManager?.setConnectedServer(null)
                         VpnCoreManager.activeVpnCoreManager?.stopTracking()
                     }
-                    stopSelf() // توقف سرویس هنگام خروج غیرمنتظره Xray
+                    stopSelf()
                 }
             } catch (e: Throwable) {
                 repository.log("XRAY-CORE", "ERROR", "Exception execution: ${e.localizedMessage ?: e.toString()}")
@@ -242,11 +239,13 @@ class V2RayVpnService : VpnService() {
     }
 
     private suspend fun performCleanup(repository: V2RayRepository? = null) {
-        cleanupMutex.withLock {
-            if (cleanupDone.getAndSet(true)) return@withLock
-            try { HevSocks5Tunnel.stop(); hevTunnelThread?.join(2000) } catch (e: Exception) { Log.e("TUNNEL", "Stop error: ${e.localizedMessage}") } finally { hevTunnelThread = null }
-            try { xrayProcess?.destroy() } catch (e: Exception) { Log.e("CORE", "Destroy error: ${e.localizedMessage}") } finally { xrayProcess = null }
-            try { interfaceDescriptor?.close() } catch (e: Exception) { Log.e("INTERFACE", "Close error: ${e.localizedMessage}") } finally { interfaceDescriptor = null }
+        withContext(NonCancellable) {
+            synchronized(cleanupLock) {
+                if (cleanupDone.getAndSet(true)) return@synchronized
+                try { HevSocks5Tunnel.stop(); hevTunnelThread?.join(2000) } catch (e: Exception) { Log.e("TUNNEL", "Stop error: ${e.localizedMessage}") } finally { hevTunnelThread = null }
+                try { xrayProcess?.destroy() } catch (e: Exception) { Log.e("CORE", "Destroy error: ${e.localizedMessage}") } finally { xrayProcess = null }
+                try { interfaceDescriptor?.close() } catch (e: Exception) { Log.e("INTERFACE", "Close error: ${e.localizedMessage}") } finally { interfaceDescriptor = null }
+            }
         }
     }
 
@@ -260,7 +259,7 @@ class V2RayVpnService : VpnService() {
                 VpnCoreManager.activeVpnCoreManager?.setConnectedServer(null)
                 VpnCoreManager.activeVpnCoreManager?.stopTracking()
             }
-            stopSelf() // توقف کامل سرویس پس از قطع دستی
+            stopSelf()
         }
     }
 
@@ -272,7 +271,15 @@ class V2RayVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        try { HevSocks5Tunnel.stop(); xrayProcess?.destroy(); interfaceDescriptor?.close() } catch (e: Exception) { Log.e("VPN", "Destroy cleanup error: ${e.message}") }
+        synchronized(cleanupLock) {
+            if (!cleanupDone.getAndSet(true)) {
+                try { HevSocks5Tunnel.stop() } catch (e: Exception) {}
+                try { xrayProcess?.destroy() } catch (e: Exception) {}
+                try { interfaceDescriptor?.close() } catch (e: Exception) {}
+                xrayProcess = null
+                interfaceDescriptor = null
+            }
+        }
         serviceJob.cancel()
         super.onDestroy()
     }
