@@ -227,6 +227,7 @@ class V2RayRepository(private val db: V2RayDatabase) {
                 val securityParam = params["security"]?.lowercase() ?: "none"
                 val tls = securityParam == "tls" || securityParam == "reality" || params["tls"] == "true"
                 val sni = params["sni"] ?: ""
+                val host = params["host"] ?: ""
                 val network = params["type"] ?: params["network"] ?: "tcp"
                 val path = params["path"] ?: ""
                 val flow = params["flow"] ?: ""
@@ -247,6 +248,7 @@ class V2RayRepository(private val db: V2RayDatabase) {
                     uuid = uuid,
                     tls = tls,
                     sni = sni,
+                    host = host,
                     network = network,
                     path = path,
                     security = securityParam,
