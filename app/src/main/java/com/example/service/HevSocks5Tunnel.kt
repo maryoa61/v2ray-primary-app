@@ -86,7 +86,10 @@ object HevSocks5Tunnel {
             tunnel:
               name: tun0
               mtu: $TUNNEL_MTU
-              multi-queue: true  # تغییر ۱: فعال سازی چند صفحوه برای افزایش شدید سرعت و استفاده از چند هسته پردازنده
+              # multi-queue needs a kernel multi-queue TUN, which Android's
+              # VpnService doesn't provide — it makes hev exit cleanly (code 0)
+              # a minute or two after connect. Keep single-queue on Android.
+              multi-queue: false
             socks5:
               address: 127.0.0.1
               port: $socksPort
