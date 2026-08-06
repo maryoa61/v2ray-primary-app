@@ -78,7 +78,8 @@ object XrayConfigGenerator {
               "protocol": "socks",
               "settings": {
                 "auth": "noauth",
-                "udp": true
+                "udp": true,
+                "ip": "127.0.0.1"
               },
               "sniffing": {
                 "enabled": true,
