@@ -145,88 +145,58 @@ class V2RayVpnService : VpnService() {
             repository.log("VPN", "INFO", "Connecting to node: ${server.name} (${server.address}:${server.port})")
 
             try {
-                repository.log("TUNNEL", "INFO", "Allocating local tun0 interface file descriptor...")
+                /*
+                 * Startup order is intentional:
+                 *
+                 *   prepare assets/config -> start Xray -> wait for SOCKS
+                 *   -> establish TUN -> start HEV immediately -> CONNECTED
+                 *
+                 * Builder.establish() installs the VPN route immediately. Doing
+                 * it before Xray/HEV are ready creates a window where packets
+                 * enter TUN but nothing consumes them, which causes the brief
+                 * internet interruption seen during VPN startup.
+                 */
 
-                val builder = Builder()
-                    .setSession("V2RayDan")
-                    .addAddress("172.19.0.1", 30)
-                    .addRoute("0.0.0.0", 0)
-                    .addDnsServer("1.1.1.1")
-                    .addDnsServer("8.8.8.8")
-                    .setMtu(1400) // MUST match hev-socks5-tunnel config (HevSocks5Tunnel.writeConfig mtu=1400).
-                                  // MTU 1500 breaks data transfer: TCP segments (1460B) exceed the tunnel's
-                                  // 1400B buffer, so handshakes succeed but data packets get dropped ->
-                                  // "connected but no site opens" with a silent xray log.
+                repository.log("TUNNEL", "INFO", "Preparing Xray before installing VPN routes...")
 
                 try {
-                    builder.addDisallowedApplication(packageName)
-                    repository.log("TUNNEL", "INFO", "Bypassed package: $packageName")
+                    listOf("geoip.dat", "geosite.dat").forEach { filename ->
+                        val destFile = File(filesDir, filename)
+                        if (!destFile.exists() || destFile.length() == 0L) {
+                            assets.open(filename).use { input ->
+                                destFile.outputStream().use { output ->
+                                    input.copyTo(output)
+                                }
+                            }
+                        }
+                    }
                 } catch (e: Exception) {
-                    repository.log("TUNNEL", "WARNING", "Exclusion failed: ${e.localizedMessage}")
+                    repository.log("SYSTEM", "WARNING", "Databases sync error: ${e.localizedMessage}")
                 }
 
-                interfaceDescriptor = builder.establish()
-                if (interfaceDescriptor == null) {
-                    // FIX: a null interface is FATAL. Continuing would show
-                    // "CONNECTED" while no tun device exists and no traffic is
-                    // routed through the VPN.
-                    repository.log("TUNNEL", "ERROR", "VpnService.Builder returned null Interface.")
+                val configJson = XrayConfigGenerator.generate(server, filesDir)
+                val configFile = File(cacheDir, "xray_config.json")
+                try {
+                    configFile.writeText(configJson)
+                } catch (e: Exception) {
+                    repository.log("CONFIG", "ERROR", "Failed to cache configuration: ${e.localizedMessage}")
+                }
+
+                val binary = locateCoreBinary(applicationContext, repository)
+                if (binary == null || !binary.exists()) {
+                    repository.log("XRAY-CORE", "ERROR", "Binary execute target missing.")
                     withContext(Dispatchers.Main) {
                         VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
                     }
                     stopSelf()
                     return@launch
                 }
-                repository.log("TUNNEL", "SUCCESS", "Tun interface established.")
-            } catch (e: Exception) {
-                repository.log("TUNNEL", "ERROR", "Tunnel build failed: ${e.localizedMessage}")
-                withContext(Dispatchers.Main) {
-                    VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
+
+                val commandList = mutableListOf<String>().apply {
+                    add(binary.absolutePath)
+                    add("-config")
+                    add(configFile.absolutePath)
                 }
-                stopSelf()
-                return@launch
-            }
-
-            val fdNum = interfaceDescriptor?.fd ?: -1
-
-            try {
-                listOf("geoip.dat", "geosite.dat").forEach { filename ->
-                    val destFile = File(filesDir, filename)
-                    if (!destFile.exists() || destFile.length() == 0L) {
-                        assets.open(filename).use { input ->
-                            destFile.outputStream().use { output ->
-                                input.copyTo(output)
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                repository.log("SYSTEM", "WARNING", "Databases sync error: ${e.localizedMessage}")
-            }
-
-            val configJson = XrayConfigGenerator.generate(server, filesDir)
-            val configFile = File(cacheDir, "xray_config.json")
-            try {
-                configFile.writeText(configJson)
-            } catch (e: Exception) {
-                repository.log("CONFIG", "ERROR", "Failed to cache configuration: ${e.localizedMessage}")
-            }
-
-            val binary = locateCoreBinary(applicationContext, repository)
-            if (binary == null || !binary.exists()) {
-                repository.log("XRAY-CORE", "ERROR", "Binary execute target missing.")
-                withContext(Dispatchers.Main) {
-                    VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
-                }
-                stopSelf()
-                return@launch
-            }
-
-            try {
-                val commandList = mutableListOf<String>()
-                commandList.add(binary.absolutePath)
-                commandList.add("-config")
-                commandList.add(configFile.absolutePath)
 
                 val processBuilder = ProcessBuilder()
                     .command(commandList)
@@ -236,48 +206,77 @@ class V2RayVpnService : VpnService() {
                 processBuilder.environment()["V2RAY_LOCATION_ASSET"] = filesDir.absolutePath
 
                 xrayProcess = processBuilder.start()
+                repository.log("XRAY-CORE", "INFO", "Xray process started before VPN route installation.")
 
                 val logJob = serviceScope.launch {
-                    val reader = BufferedReader(InputStreamReader(xrayProcess?.inputStream))
-                    var line: String?
-                    // Collapse repeated failure spam: a dead/blocked node makes xray
-                    // emit 10+ identical "failed to dial ... reset by peer" lines per
-                    // second. Every line used to hit Room (1 insert each), saturating
-                    // the IO dispatcher and freezing the whole app (UI + tunnel).
-                    // Connection IDs and source ports vary per line, so compare a
-                    // normalized key.
+                    val process = xrayProcess ?: return@launch
+                    val reader = BufferedReader(InputStreamReader(process.inputStream))
+
                     var lastNormalized = ""
                     var repeatCount = 0
                     var lastRepeatSummaryAt = 0L
-                    while (isActive && xrayProcess != null) {
-                        line = try {
-                            withContext(Dispatchers.IO) { reader.readLine() }
+
+                    while (isActive && xrayProcess === process) {
+                        val line = try {
+                            reader.readLine()
                         } catch (e: Exception) {
-                            // Process was destroyed while we were reading.
                             null
                         }
+
                         if (line == null) break
+
                         if (line.isNotBlank()) {
-                            val isNoisy = line.contains("tcp:") || line.contains("udp:") || line.contains("email:") || line.contains("accepted") || line.contains("127.0.0.1:")
-                            if (!isNoisy || line.contains("warning", ignoreCase = true) || line.contains("error", ignoreCase = true)) {
+                            val isNoisy = line.contains("tcp:") ||
+                                    line.contains("udp:") ||
+                                    line.contains("email:") ||
+                                    line.contains("accepted") ||
+                                    line.contains("127.0.0.1:")
+
+                            if (!isNoisy ||
+                                line.contains("warning", ignoreCase = true) ||
+                                line.contains("error", ignoreCase = true)
+                            ) {
                                 val normalized = line
                                     .replace(Regex("\\[[0-9]+\\]"), "[ID]")
-                                    .replace(Regex("[0-9]{1,3}(\\.[0-9]{1,3}){3}:[0-9]+->"), "SRC->")
+                                    .replace(
+                                        Regex("[0-9]{1,3}(\\.[0-9]{1,3}){3}:[0-9]+->"),
+                                        "SRC->"
+                                    )
+
                                 if (normalized == lastNormalized) {
                                     repeatCount++
                                     val now = System.currentTimeMillis()
-                                    if (repeatCount % 25 == 0 && now - lastRepeatSummaryAt > 2000) {
-                                        repository.log("XRAY-CORE", "WARNING", "… last error repeated $repeatCount times (suppressing flood)")
+                                    if (repeatCount % 25 == 0 &&
+                                        now - lastRepeatSummaryAt > 2000
+                                    ) {
+                                        repository.log(
+                                            "XRAY-CORE",
+                                            "WARNING",
+                                            "… last error repeated $repeatCount times (suppressing flood)"
+                                        )
                                         lastRepeatSummaryAt = now
                                     }
                                     continue
                                 }
+
                                 if (repeatCount > 0) {
-                                    repository.log("XRAY-CORE", "WARNING", "… previous message repeated $repeatCount times")
+                                    repository.log(
+                                        "XRAY-CORE",
+                                        "WARNING",
+                                        "… previous message repeated $repeatCount times"
+                                    )
                                     repeatCount = 0
                                 }
-                                val trimmedLine = if (line.length > 200) line.take(200) + "..." else line
-                                repository.log("XRAY-CORE", if (line.contains("error", ignoreCase = true)) "ERROR" else "INFO", trimmedLine)
+
+                                val trimmedLine =
+                                    if (line.length > 200) line.take(200) + "..." else line
+
+                                repository.log(
+                                    "XRAY-CORE",
+                                    if (line.contains("error", ignoreCase = true)) "ERROR" else "INFO",
+                                    trimmedLine
+                                )
+
                                 lastNormalized = normalized
                             }
                         }
@@ -289,84 +288,154 @@ class V2RayVpnService : VpnService() {
                     timeoutMs = 10000,
                     processAlive = { xrayProcess?.isAlive ?: false }
                 )
+
                 if (!socksReady) {
-                    repository.log("XRAY-CORE", "ERROR", "SOCKS5 inbound never came up in time (or core exited early).")
+                    repository.log(
+                        "XRAY-CORE",
+                        "ERROR",
+                        "SOCKS5 inbound never came up in time (or core exited early)."
+                    )
+                    logJob.cancel()
+                    performCleanup(repository)
+
                     withContext(Dispatchers.Main) {
                         VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
                     }
-                    logJob.cancel()
-                    performCleanup(repository)
+
                     stopSelf()
                     return@launch
                 }
 
-                if (fdNum != -1) {
-                    val hevConfigFile = File(cacheDir, "hev_tunnel.yml")
-                    HevSocks5Tunnel.writeConfig(hevConfigFile, XrayConfigGenerator.SOCKS_INBOUND_PORT)
+                /*
+                 * Xray is now ready. Install the full-device route only after
+                 * the proxy endpoint exists, minimizing the route-without-core
+                 * window.
+                 */
+                repository.log("TUNNEL", "INFO", "Xray SOCKS is ready; installing VPN interface...")
 
-                    hevTunnelThread = Thread({
-                        var exitCode = -1
-                        try {
-                            serviceScope.launch {
-                                repository.log("HEV-TUNNEL", "INFO", "Starting tunnel with config: ${hevConfigFile.absolutePath}, fd: $fdNum, configExists: ${hevConfigFile.exists()}, configSize: ${hevConfigFile.length()}")
-                                val configContent = hevConfigFile.readText()
-                                repository.log("HEV-TUNNEL", "INFO", "Config content:\n$configContent")
-                            }
-                            exitCode = HevSocks5Tunnel.start(hevConfigFile.absolutePath, fdNum)
-                            serviceScope.launch {
-                                repository.log("HEV-TUNNEL", if (exitCode == 0) "INFO" else "ERROR", "hev loop exited with code: $exitCode")
-                            }
-                        } catch (e: Exception) {
-                            serviceScope.launch {
-                                repository.log("HEV-TUNNEL", "ERROR", "Tunnel exception: ${e.message}\n${e.stackTraceToString()}")
-                            }
-                        }
-                        // If the native tunnel died on its own (not by our request),
-                        // the app must not keep showing CONNECTED with no tunnel.
-                        // Trigger the same idempotent teardown path; the session
-                        // coroutine's post-waitFor block will pick up the exit too.
-                        if (exitCode != 0 && !intentionalStop) {
-                            serviceScope.launch {
-                                repository.log("HEV-TUNNEL", "ERROR", "Tunnel aborted unexpectedly (code $exitCode). Initiating teardown.")
-                                VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
-                                performCleanup(repository)
-                                stopSelf()
-                            }
-                        }
-                    }, "hev-socks5-tunnel").apply {
-                        isDaemon = true
-                        start()
-                    }
+                val builder = Builder()
+                    .setSession("V2RayDan")
+                    .addAddress("172.19.0.1", 30)
+                    .addRoute("0.0.0.0", 0)
+                    .addDnsServer("1.1.1.1")
+                    .addDnsServer("8.8.8.8")
+                    .setMtu(HevSocks5Tunnel.TUNNEL_MTU)
+
+                try {
+                    builder.addDisallowedApplication(packageName)
+                    repository.log("TUNNEL", "INFO", "Bypassed package: $packageName")
+                } catch (e: Exception) {
+                    repository.log("TUNNEL", "WARNING", "Exclusion failed: ${e.localizedMessage}")
                 }
 
-                // The tunnel is now genuinely up (tun fd + socks inbound + hev
-                // loop all started). Only now advertise CONNECTED so a mid-setup
-                // failure can't flash "connected" and immediately drop it.
+                interfaceDescriptor = builder.establish()
+                if (interfaceDescriptor == null) {
+                    repository.log("TUNNEL", "ERROR", "VpnService.Builder returned null Interface.")
+                    logJob.cancel()
+                    performCleanup(repository)
+
+                    withContext(Dispatchers.Main) {
+                        VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
+                    }
+
+                    stopSelf()
+                    return@launch
+                }
+
+                repository.log("TUNNEL", "SUCCESS", "Tun interface established.")
+
+                val fdNum = interfaceDescriptor?.fd ?: -1
+                if (fdNum == -1) {
+                    repository.log("TUNNEL", "ERROR", "Invalid TUN file descriptor.")
+                    logJob.cancel()
+                    performCleanup(repository)
+
+                    withContext(Dispatchers.Main) {
+                        VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
+                    }
+
+                    stopSelf()
+                    return@launch
+                }
+
+                /*
+                 * Nothing expensive is done between establish() and HEV.
+                 * The route is live now, so start the TUN consumer immediately.
+                 */
+                val hevConfigFile = File(cacheDir, "hev_tunnel.yml")
+                HevSocks5Tunnel.writeConfig(
+                    hevConfigFile,
+                    XrayConfigGenerator.SOCKS_INBOUND_PORT
+                )
+
+                hevTunnelThread = Thread({
+                    var exitCode = -1
+                    try {
+                        serviceScope.launch {
+                            repository.log(
+                                "HEV-TUNNEL",
+                                "INFO",
+                                "Starting tunnel: fd=$fdNum, config=${hevConfigFile.absolutePath}, " +
+                                        "configExists=${hevConfigFile.exists()}, configSize=${hevConfigFile.length()}"
+                            )
+                        }
+
+                        exitCode = HevSocks5Tunnel.start(
+                            hevConfigFile.absolutePath,
+                            fdNum
+                        )
+
+                        serviceScope.launch {
+                            repository.log(
+                                "HEV-TUNNEL",
+                                if (exitCode == 0) "INFO" else "ERROR",
+                                "hev loop exited with code: $exitCode"
+                            )
+                        }
+                    } catch (e: Exception) {
+                        serviceScope.launch {
+                            repository.log(
+                                "HEV-TUNNEL",
+                                "ERROR",
+                                "Tunnel exception: ${e.message}\n${e.stackTraceToString()}"
+                            )
+                        }
+                    }
+
+                    if (exitCode != 0 && !intentionalStop) {
+                        serviceScope.launch {
+                            repository.log(
+                                "HEV-TUNNEL",
+                                "ERROR",
+                                "Tunnel aborted unexpectedly (code $exitCode). Initiating teardown."
+                            )
+                            VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
+                            performCleanup(repository)
+                            stopSelf()
+                        }
+                    }
+                }, "hev-socks5-tunnel").apply {
+                    isDaemon = true
+                    start()
+                }
+
                 withContext(Dispatchers.Main) {
                     VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.CONNECTED)
                     VpnCoreManager.activeVpnCoreManager?.startTracking()
                 }
 
-                // NOTE: this call blocks the coroutine's underlying thread until
-                // the xray process exits *for any reason* — either it crashed on
-                // its own, or stopVpn() elsewhere called xrayProcess?.destroy().
-                // Either way, once we're past this line the process is gone and
-                // we must run cleanup exactly once, coordinated with whatever
-                // else might be tearing things down concurrently.
                 val exitCode = try {
                     xrayProcess?.waitFor()
                 } catch (e: Exception) {
                     null
                 }
+
                 logJob.cancel()
 
-                // FIX: on an intentional disconnect, stopVpn() cancels
-                // sessionJob first, so isActive is false here and this whole
-                // ERROR-reporting block is skipped — a clean disconnect no
-                // longer shows up as a core crash.
                 if (coroutineContext.isActive) {
                     repository.log("XRAY-CORE", "ERROR", "Core exited code: $exitCode.")
                     performCleanup(repository)
+
                     withContext(Dispatchers.Main) {
                         VpnCoreManager.activeVpnCoreManager?.updateState(VpnState.ERROR)
                         VpnCoreManager.activeVpnCoreManager?.setConnectedServer(null)
