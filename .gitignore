@@ -1,0 +1,22 @@
+*.iml
+.gradle
+.kotlin
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+.env
+debug.keystore
+# Xray core binary and geo-data (downloaded automatically by the downloadXrayCore Gradle task)
+app/src/main/jniLibs/**/libxray.so
+app/src/main/assets/geoip.dat
+app/src/main/assets/geosite.dat

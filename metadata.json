@@ -1,0 +1,6 @@
+{
+  "name": "V2Ray Dan",
+  "description": "V2Ray Dan is a premium, powerful V2Ray client with multi-profile managers, subscription sync, visual latency checks, and routing logs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
