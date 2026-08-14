@@ -1,10 +1,6 @@
 package com.example.service
 
 import com.example.data.ServerEntity
-<<<<<<< HEAD
-import com.example.service.RuntimeSettings
-=======
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 import java.io.File
 
 object XrayConfigGenerator {
@@ -60,11 +56,7 @@ object XrayConfigGenerator {
     // the VPN/TUN layer at all.
     // (helpers str()/alpnArray() above produce the JSON strings used below.)
 
-<<<<<<< HEAD
-    fun generate(server: ServerEntity, filesDir: File? = null, runtimeSettings: RuntimeSettings = RuntimeSettings()): String {
-=======
     fun generate(server: ServerEntity, filesDir: File? = null): String {
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
         val outbounds = when (server.type.uppercase()) {
             "VLESS" -> generateVlessOutbound(server)
             "VMESS" -> generateVmessOutbound(server)
@@ -85,16 +77,6 @@ object XrayConfigGenerator {
         // The regexp rules below already cover .ir domains without needing that category.
         val hasGeoip = filesDir != null && File(filesDir, "geoip.dat").exists()
 
-<<<<<<< HEAD
-        val routingRules = when (runtimeSettings.routingMode.lowercase()) {
-            "global proxy", "global" -> """"routing": { "domainStrategy": "AsIs", "rules": [{"type":"field","outboundTag":"proxy","network":"tcp,udp"}] },"""
-            "direct routing", "direct" -> """"routing": { "domainStrategy": "AsIs", "rules": [{"type":"field","outboundTag":"direct","network":"tcp,udp"}] },"""
-            else -> {
-                val bypassDomains = if (runtimeSettings.bypassList.isEmpty()) "regexp:\\\\.ir$" else runtimeSettings.bypassList.joinToString(",") { str(it) }
-                """"routing": { "domainStrategy": "IPIfNonMatch", "rules": [{"type":"field","outboundTag":"direct","domain":[${bypassDomains}]},{"type":"field","outboundTag":"direct","ip":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","fc00::/7","fe80::/10"]},{"type":"field","outboundTag":"proxy","network":"tcp,udp"}] },"""
-            }
-        }
-=======
         val routingRules = """
           "routing": {
             "domainStrategy": "IPIfNonMatch",
@@ -130,7 +112,6 @@ object XrayConfigGenerator {
           },
         """.trimIndent()
 
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
         return """
         {
           "log": {
@@ -152,11 +133,6 @@ object XrayConfigGenerator {
                 "destOverride": ["http", "tls"]
               }
             },
-<<<<<<< HEAD
-            ${if (runtimeSettings.httpInboundEnabled) """,
-            { "port": 10809, "listen": "127.0.0.1", "protocol": "http", "settings": {}, "sniffing": { "enabled": false, "destOverride": ["http", "tls"] } }
-            """ else ""}
-=======
             {
               "port": 10809,
               "listen": "127.0.0.1",
@@ -167,7 +143,6 @@ object XrayConfigGenerator {
                 "destOverride": ["http", "tls"]
               }
             }
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
           ],
           "outbounds": [
             $outbounds,
@@ -214,10 +189,6 @@ object XrayConfigGenerator {
             "port": ${server.port},
             "id": ${str(server.uuid)},
             "security": ${str(server.security.ifEmpty { "auto" })},
-<<<<<<< HEAD
-            "alterId": ${server.alterId},
-=======
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
             "level": 0
           },
           "streamSettings": $streamSettingsJson,
@@ -290,12 +261,7 @@ object XrayConfigGenerator {
         // Keep the actual json output as h2/http2, kcp, ... valid names.
         fun normalizedNetwork(raw: String): String = when (raw.lowercase()) {
             "mkcp", "kcp" -> "kcp"
-<<<<<<< HEAD
-            "h2", "http2" -> "h2"
-            "splithttp" -> "xhttp"
-=======
             "h2" -> "h2"
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
             else -> raw.lowercase().ifEmpty { "tcp" }
         }
 
@@ -343,12 +309,6 @@ object XrayConfigGenerator {
         }
 
         val transportConfig = when (server.network.lowercase()) {
-<<<<<<< HEAD
-            "tcp" -> if (server.headerType.isNotBlank()) """
-            "tcpSettings": { "header": { "type": ${str(server.headerType)} } }
-            """ else ""
-=======
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
             "ws" -> """
             "wsSettings": {
               "path": ${str(server.path.ifEmpty { "/" })},

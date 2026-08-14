@@ -1,12 +1,9 @@
 package com.example.data
 
-import android.util.Base64
-<<<<<<< HEAD
 import android.content.Context
-import com.example.service.RuntimeSettings
-=======
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
+import android.util.Base64
 import android.util.Log
+import com.example.service.RuntimeSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -21,10 +18,6 @@ import java.net.URLDecoder as JURLDecoder
 import java.nio.charset.StandardCharsets
 
 class V2RayRepository(private val db: V2RayDatabase) {
-<<<<<<< HEAD
-
-=======
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
     private val serverDao = db.serverDao()
     private val subscriptionDao = db.subscriptionDao()
     private val logDao = db.logDao()
@@ -34,13 +27,12 @@ class V2RayRepository(private val db: V2RayDatabase) {
     val allSubscriptions: Flow<List<SubscriptionEntity>> = subscriptionDao.getAllSubscriptions()
     val logs: Flow<List<LogEntity>> = logDao.getRecentLogs()
 
-<<<<<<< HEAD
     companion object {
-        @Volatile private var settingsPreferences: android.content.SharedPreferences? = null
-        fun initializeSettings(context: Context) { settingsPreferences = context.getSharedPreferences("runtime_settings", Context.MODE_PRIVATE) }
+        @Volatile private var preferences: android.content.SharedPreferences? = null
+        fun initializeSettings(context: Context) { preferences = context.getSharedPreferences("runtime_settings", Context.MODE_PRIVATE) }
     }
     fun getRuntimeSettings(): RuntimeSettings {
-        val p = settingsPreferences ?: return RuntimeSettings()
+        val p = preferences ?: return RuntimeSettings()
         return RuntimeSettings(
             dnsServers = p.getString("dnsServers", "1.1.1.1")!!.split(",").map { it.trim() }.filter { it.isNotEmpty() },
             routingMode = p.getString("routingMode", "Bypass LAN & Mainland")!!,
@@ -50,16 +42,8 @@ class V2RayRepository(private val db: V2RayDatabase) {
             autoConnectEnabled = p.getBoolean("autoConnectEnabled", false)
         )
     }
-    fun saveRuntimeSettings(settings: RuntimeSettings) { settingsPreferences?.edit()?.putString("dnsServers", settings.dnsServers.joinToString(","))?.putString("routingMode", settings.routingMode)?.putInt("mtu", settings.mtu)?.putBoolean("httpInboundEnabled", settings.httpInboundEnabled)?.putString("bypassList", settings.bypassList.joinToString(","))?.putBoolean("autoConnectEnabled", settings.autoConnectEnabled)?.apply() }
+    fun saveRuntimeSettings(settings: RuntimeSettings) { preferences?.edit()?.putString("dnsServers", settings.dnsServers.joinToString(","))?.putString("routingMode", settings.routingMode)?.putInt("mtu", settings.mtu)?.putBoolean("httpInboundEnabled", settings.httpInboundEnabled)?.putString("bypassList", settings.bypassList.joinToString(","))?.putBoolean("autoConnectEnabled", settings.autoConnectEnabled)?.apply() }
 
-    private fun parseHostPort(value: String, defaultPort: Int): Pair<String, Int> {
-        val raw = value.substringBefore('?').substringBefore('#')
-        if (raw.startsWith("[")) { val end = raw.indexOf(']'); if (end > 0) return raw.substring(1, end) to raw.substring(end + 1).removePrefix(":").toIntOrNull().let { it ?: defaultPort } }
-        val colon = raw.lastIndexOf(':'); return if (colon > 0 && raw.indexOf(':') == colon) raw.substring(0, colon) to (raw.substring(colon + 1).toIntOrNull() ?: defaultPort) else raw to defaultPort
-    }
-
-=======
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
     suspend fun getSelectedServer(): ServerEntity? = serverDao.getSelectedServer()
 
     suspend fun selectServer(id: Long) {
@@ -238,9 +222,6 @@ class V2RayRepository(private val db: V2RayDatabase) {
                 val hashIndex = hostPortAndQuery.indexOf('#')
 
                 val hostPort = if (questionIndex != -1) hostPortAndQuery.substring(0, questionIndex) else if (hashIndex != -1) hostPortAndQuery.substring(0, hashIndex) else hostPortAndQuery
-<<<<<<< HEAD
-                val (address, port) = parseHostPort(hostPort, 443)
-=======
                 val address: String
                 val port: Int
                 if (hostPort.contains(':')) {
@@ -251,7 +232,6 @@ class V2RayRepository(private val db: V2RayDatabase) {
                     address = hostPort
                     port = 443
                 }
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
                 var name = "VLESS Server"
                 var paramsStr = ""
@@ -361,13 +341,9 @@ class V2RayRepository(private val db: V2RayDatabase) {
                         left
                     }
 
-<<<<<<< HEAD
-                    val (address, port) = parseHostPort(right, 1080)
-=======
                     val colonIndex = right.indexOf(':')
                     val address = if (colonIndex != -1) right.substring(0, colonIndex) else right
                     val port = if (colonIndex != -1) right.substring(colonIndex + 1).toIntOrNull() ?: 1080 else 1080
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
                     return ServerEntity(
                         name = serverName,
@@ -388,16 +364,12 @@ class V2RayRepository(private val db: V2RayDatabase) {
                 val hashIndex = hostPortAndQuery.indexOf('#')
                 val hostPort = if (questionIndex != -1) hostPortAndQuery.substring(0, questionIndex) else if (hashIndex != -1) hostPortAndQuery.substring(0, hashIndex) else hostPortAndQuery
 
-<<<<<<< HEAD
-                val (address, port) = parseHostPort(hostPort, 443)
-=======
                 val (address, port) = if (hostPort.contains(':')) {
                     val parts = hostPort.split(":", limit = 2)
                     parts[0] to (parts.getOrNull(1)?.toIntOrNull() ?: 443)
                 } else {
                     hostPort to 443
                 }
->>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
                 var name = "Trojan Server"
                 var paramsStr = ""
