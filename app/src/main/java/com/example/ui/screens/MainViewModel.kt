@@ -11,6 +11,7 @@ import com.example.data.V2RayRepository
 import com.example.service.SpeedState
 import com.example.service.VpnCoreManager
 import com.example.service.VpnState
+<<<<<<< HEAD
 import com.example.service.RuntimeSettings
 import com.example.service.AutoConnectService
 import kotlinx.coroutines.flow.*
@@ -23,6 +24,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val repository = V2RayRepository(database).also { V2RayRepository.initializeSettings(application) }
     val vpnCoreManager = VpnCoreManager(application, repository)
     private val lifecycleMutex = Mutex()
+=======
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+    private val database = V2RayDatabase.getDatabase(application)
+    val repository = V2RayRepository(database)
+    val vpnCoreManager = VpnCoreManager(application, repository)
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
     // Flow for VPN integration requests from MainActivity
     private val _vpnPermissionRequest = MutableSharedFlow<android.content.Intent>(extraBufferCapacity = 1)
@@ -55,6 +65,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val isTestingPing: StateFlow<Map<Long, Boolean>> = _isTestingPing.asStateFlow()
 
     // Background optimizer service active status and launcher toggle (Disabled from root)
+<<<<<<< HEAD
     val isAutoConnectActive: StateFlow<Boolean> = AutoConnectService.isServiceActive
 
     fun toggleAutoConnect() {
@@ -78,6 +89,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val routingMode: StateFlow<String> = runtimeSettings.map { it.routingMode }.stateIn(viewModelScope, SharingStarted.Eagerly, initialSettings.routingMode)
     val dnsServer: StateFlow<String> = runtimeSettings.map { it.dnsServers.firstOrNull().orEmpty() }.stateIn(viewModelScope, SharingStarted.Eagerly, initialSettings.dnsServers.firstOrNull().orEmpty())
     val bypassList: StateFlow<Boolean> = runtimeSettings.map { it.bypassList.isNotEmpty() }.stateIn(viewModelScope, SharingStarted.Eagerly, initialSettings.bypassList.isNotEmpty())
+=======
+    val isAutoConnectActive: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow()
+
+    fun toggleAutoConnect() {
+        // Disabled from root as requested
+    }
+
+    // Preferences configuration (Saved locally inside DB or simple local memory)
+    private val _routingMode = MutableStateFlow("Bypass LAN & Mainland") // Bypass LAN & Mainland, Global, Direct
+    val routingMode: StateFlow<String> = _routingMode.asStateFlow()
+
+    private val _dnsServer = MutableStateFlow("1.1.1.1")
+    val dnsServer: StateFlow<String> = _dnsServer.asStateFlow()
+
+    private val _bypassList = MutableStateFlow(true)
+    val bypassList: StateFlow<Boolean> = _bypassList.asStateFlow()
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
     init {
         // هیچ سرور دمویی ساخته نمیشه
@@ -87,7 +115,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val isRunning = vpnState.value == VpnState.CONNECTED || vpnState.value == VpnState.CONNECTING
             if (isRunning) {
+<<<<<<< HEAD
                 vpnCoreManager.stopVpnAndAwait()
+=======
+                vpnCoreManager.stopVpn()
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
             } else {
                 val currentActive = activeServer.value
                 val context = getApplication<Application>()
@@ -115,6 +147,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectServer(server: ServerEntity) {
         viewModelScope.launch {
+<<<<<<< HEAD
             lifecycleMutex.withLock {
             // If connected, we should stop and reconnect to the new server
             val isRunning = vpnState.value == VpnState.CONNECTED || vpnState.value == VpnState.CONNECTING
@@ -124,6 +157,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 repository.selectServer(server.id)
             }
             }
+=======
+            // If connected, we should stop and reconnect to the new server
+            val isRunning = vpnState.value == VpnState.CONNECTED || vpnState.value == VpnState.CONNECTING
+            if (isRunning) {
+                vpnCoreManager.stopVpn()
+                repository.selectServer(server.id)
+                vpnCoreManager.toggleVpn(server)
+            } else {
+                repository.selectServer(server.id)
+            }
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
         }
     }
 
@@ -235,12 +279,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+<<<<<<< HEAD
     fun setRoutingMode(mode: String) { updateSettings(_runtimeSettings.value.copy(routingMode = mode)); viewModelScope.launch { repository.log("ROUTING", "INFO", "Changed proxy routing strategy to: $mode") } }
     fun setDnsServer(dns: String) { updateSettings(_runtimeSettings.value.copy(dnsServers = dns.split(",").map { it.trim() }.filter { it.isNotEmpty() })); viewModelScope.launch { repository.log("SYSTEM", "INFO", "Updated DNS server address: $dns") } }
     fun setMtu(mtu: Int) { updateSettings(_runtimeSettings.value.copy(mtu = mtu.coerceIn(1280, 1500))) }
     fun setHttpInboundEnabled(enabled: Boolean) { updateSettings(_runtimeSettings.value.copy(httpInboundEnabled = enabled)) }
     fun setAutoConnectEnabled(enabled: Boolean) { updateSettings(_runtimeSettings.value.copy(autoConnectEnabled = enabled)) }
     private fun updateSettings(settings: RuntimeSettings) { _runtimeSettings.value = settings; repository.saveRuntimeSettings(settings) }
+=======
+    fun setRoutingMode(mode: String) {
+        _routingMode.value = mode
+        viewModelScope.launch {
+            repository.log("ROUTING", "INFO", "Changed proxy routing strategy to: $mode")
+        }
+    }
+
+    fun setDnsServer(dns: String) {
+        _dnsServer.value = dns
+        viewModelScope.launch {
+            repository.log("SYSTEM", "INFO", "Updated DNS server address: $dns")
+        }
+    }
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
     fun addSubscriptionUrl(name: String, url: String) {
         viewModelScope.launch {

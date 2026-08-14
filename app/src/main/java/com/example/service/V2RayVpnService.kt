@@ -75,7 +75,10 @@ class V2RayVpnService : VpnService() {
     // re-enable the double-stop of the native tunnel -> SIGSEGV).
     private val cleanupMutex = Mutex()
     private val cleanupDone = AtomicBoolean(false)
+<<<<<<< HEAD
     @Volatile private var cleanupCompletion = CompletableDeferred<Unit>()
+=======
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
     companion object {
         const val ACTION_START = "com.example.service.START"
@@ -130,7 +133,10 @@ class V2RayVpnService : VpnService() {
             // finish BEFORE arming the cleanup flag for this new session.
             cleanupMutex.withLock { cleanupDone.set(false) }
 
+<<<<<<< HEAD
             V2RayRepository.initializeSettings(applicationContext)
+=======
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
             val db = V2RayDatabase.getDatabase(applicationContext)
             val repository = V2RayRepository(db)
             val server = repository.getSelectedServer()
@@ -176,8 +182,12 @@ class V2RayVpnService : VpnService() {
                     repository.log("SYSTEM", "WARNING", "Databases sync error: ${e.localizedMessage}")
                 }
 
+<<<<<<< HEAD
                 val runtimeSettings = repository.getRuntimeSettings()
                 val configJson = XrayConfigGenerator.generate(server, filesDir, runtimeSettings)
+=======
+                val configJson = XrayConfigGenerator.generate(server, filesDir)
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
                 val configFile = File(cacheDir, "xray_config.json")
                 try {
                     configFile.writeText(configJson)
@@ -316,6 +326,7 @@ class V2RayVpnService : VpnService() {
                  */
                 repository.log("TUNNEL", "INFO", "Xray SOCKS is ready; installing VPN interface...")
 
+<<<<<<< HEAD
                 val builder = Builder().setSession("V2RayDan").addAddress("172.19.0.1", 30).setMtu(runtimeSettings.mtu)
                 if (runtimeSettings.routingMode.lowercase() != "direct routing" && runtimeSettings.routingMode.lowercase() != "direct") builder.addRoute("0.0.0.0", 0)
                 runtimeSettings.dnsServers.filter { it.isNotBlank() }.forEach { dns -> try { builder.addDnsServer(dns) } catch (_: IllegalArgumentException) { repository.log("TUNNEL", "WARNING", "Ignoring invalid DNS server: $dns") } }
@@ -323,6 +334,18 @@ class V2RayVpnService : VpnService() {
                 try {
                     builder.addDisallowedApplication(packageName)
                     runtimeSettings.bypassList.filter { it.contains(".") && !it.contains("/") }.forEach { packageNameToBypass -> try { builder.addDisallowedApplication(packageNameToBypass) } catch (_: Exception) { } }
+=======
+                val builder = Builder()
+                    .setSession("V2RayDan")
+                    .addAddress("172.19.0.1", 30)
+                    .addRoute("0.0.0.0", 0)
+                    .addDnsServer("1.1.1.1")
+                    .addDnsServer("8.8.8.8")
+                    .setMtu(HevSocks5Tunnel.TUNNEL_MTU)
+
+                try {
+                    builder.addDisallowedApplication(packageName)
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
                     repository.log("TUNNEL", "INFO", "Bypassed package: $packageName")
                 } catch (e: Exception) {
                     repository.log("TUNNEL", "WARNING", "Exclusion failed: ${e.localizedMessage}")
@@ -534,12 +557,18 @@ class V2RayVpnService : VpnService() {
             } finally {
                 interfaceDescriptor = null
             }
+<<<<<<< HEAD
             cleanupCompletion.complete(Unit)
         }
     }
 
     suspend fun awaitCleanup() { cleanupCompletion.await() }
 
+=======
+        }
+    }
+
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
     private fun stopVpn() {
         // Tell the running session this is an intentional stop: its
         // post-waitFor() block will see isActive == false and won't report an
@@ -547,10 +576,15 @@ class V2RayVpnService : VpnService() {
         // treat a clean quit as a crash.
         intentionalStop = true
         sessionJob?.cancel()
+<<<<<<< HEAD
         cleanupCompletion = CompletableDeferred()
 
         serviceScope.launch {
             V2RayRepository.initializeSettings(applicationContext)
+=======
+
+        serviceScope.launch {
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
             val db = V2RayDatabase.getDatabase(applicationContext)
             val repository = V2RayRepository(db)
 
@@ -589,10 +623,29 @@ class V2RayVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+<<<<<<< HEAD
         // Signal cancellation only. ACTION_STOP owns the single awaitable cleanup path.
         intentionalStop = true
         sessionJob?.cancel()
         serviceJob.cancel()
+=======
+        // Cancel the scope first so the session coroutine's post-waitFor()
+        // block sees isActive == false and won't report an ERROR while the
+        // service is being torn down.
+        intentionalStop = true
+        serviceJob.cancel()
+
+        // Run cleanup on a separate thread so onDestroy() never blocks the
+        // main thread. If a stopVpn()/performCleanup() call is already in
+        // flight from ACTION_STOP, this one will just block on the mutex, see
+        // cleanupDone == true, and return immediately — no double teardown.
+        Thread {
+            runBlocking {
+                performCleanup()
+            }
+        }.start()
+
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
         super.onDestroy()
     }
 }

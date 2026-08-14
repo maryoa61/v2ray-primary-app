@@ -1,8 +1,11 @@
 package com.example.data
 
 import android.util.Base64
+<<<<<<< HEAD
 import android.content.Context
 import com.example.service.RuntimeSettings
+=======
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -18,7 +21,10 @@ import java.net.URLDecoder as JURLDecoder
 import java.nio.charset.StandardCharsets
 
 class V2RayRepository(private val db: V2RayDatabase) {
+<<<<<<< HEAD
 
+=======
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
     private val serverDao = db.serverDao()
     private val subscriptionDao = db.subscriptionDao()
     private val logDao = db.logDao()
@@ -28,6 +34,7 @@ class V2RayRepository(private val db: V2RayDatabase) {
     val allSubscriptions: Flow<List<SubscriptionEntity>> = subscriptionDao.getAllSubscriptions()
     val logs: Flow<List<LogEntity>> = logDao.getRecentLogs()
 
+<<<<<<< HEAD
     companion object {
         @Volatile private var settingsPreferences: android.content.SharedPreferences? = null
         fun initializeSettings(context: Context) { settingsPreferences = context.getSharedPreferences("runtime_settings", Context.MODE_PRIVATE) }
@@ -51,6 +58,8 @@ class V2RayRepository(private val db: V2RayDatabase) {
         val colon = raw.lastIndexOf(':'); return if (colon > 0 && raw.indexOf(':') == colon) raw.substring(0, colon) to (raw.substring(colon + 1).toIntOrNull() ?: defaultPort) else raw to defaultPort
     }
 
+=======
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
     suspend fun getSelectedServer(): ServerEntity? = serverDao.getSelectedServer()
 
     suspend fun selectServer(id: Long) {
@@ -229,7 +238,20 @@ class V2RayRepository(private val db: V2RayDatabase) {
                 val hashIndex = hostPortAndQuery.indexOf('#')
 
                 val hostPort = if (questionIndex != -1) hostPortAndQuery.substring(0, questionIndex) else if (hashIndex != -1) hostPortAndQuery.substring(0, hashIndex) else hostPortAndQuery
+<<<<<<< HEAD
                 val (address, port) = parseHostPort(hostPort, 443)
+=======
+                val address: String
+                val port: Int
+                if (hostPort.contains(':')) {
+                    val parts = hostPort.split(":", limit = 2)
+                    address = parts[0]
+                    port = parts.getOrNull(1)?.toIntOrNull() ?: 443
+                } else {
+                    address = hostPort
+                    port = 443
+                }
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
                 var name = "VLESS Server"
                 var paramsStr = ""
@@ -339,7 +361,13 @@ class V2RayRepository(private val db: V2RayDatabase) {
                         left
                     }
 
+<<<<<<< HEAD
                     val (address, port) = parseHostPort(right, 1080)
+=======
+                    val colonIndex = right.indexOf(':')
+                    val address = if (colonIndex != -1) right.substring(0, colonIndex) else right
+                    val port = if (colonIndex != -1) right.substring(colonIndex + 1).toIntOrNull() ?: 1080 else 1080
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
                     return ServerEntity(
                         name = serverName,
@@ -360,7 +388,16 @@ class V2RayRepository(private val db: V2RayDatabase) {
                 val hashIndex = hostPortAndQuery.indexOf('#')
                 val hostPort = if (questionIndex != -1) hostPortAndQuery.substring(0, questionIndex) else if (hashIndex != -1) hostPortAndQuery.substring(0, hashIndex) else hostPortAndQuery
 
+<<<<<<< HEAD
                 val (address, port) = parseHostPort(hostPort, 443)
+=======
+                val (address, port) = if (hostPort.contains(':')) {
+                    val parts = hostPort.split(":", limit = 2)
+                    parts[0] to (parts.getOrNull(1)?.toIntOrNull() ?: 443)
+                } else {
+                    hostPort to 443
+                }
+>>>>>>> 81099166748c1091a99f14777d37940c6ca17c63
 
                 var name = "Trojan Server"
                 var paramsStr = ""
