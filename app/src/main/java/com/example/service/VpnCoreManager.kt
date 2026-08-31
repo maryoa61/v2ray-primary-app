@@ -139,7 +139,23 @@ class VpnCoreManager(private val context: Context, private val repository: V2Ray
             if (current?.id == server.id && (_vpnState.value == VpnState.CONNECTED || _vpnState.value == VpnState.CONNECTING)) return
             if (_vpnState.value != VpnState.DISCONNECTED && _vpnState.value != VpnState.ERROR) {
                 stopVpnInternal(clearPending = true)
-                vpnState.filter { it == VpnState.DISCONNECTED || it == VpnState.ERROR }.first()
+                // FIX (potential infinite hang): the service process can be
+                // killed by the system (low memory / OEM battery saver) BEFORE
+                // it processes ACTION_STOP, in which case DISCONNECTED never
+                // arrives and this `first()` suspended forever — holding
+                // lifecycleMutex, so every later connect/switch call queued up
+                // behind it and the UI looked frozen. Bound the wait; if the
+                // teardown confirmation does not arrive we continue to start
+                // the new session anyway (the old process is dead).
+                val settled = withTimeoutOrNull(15_000L) {
+                    vpnState.filter { it == VpnState.DISCONNECTED || it == VpnState.ERROR }.first()
+                    true
+                }
+                if (settled == null) {
+                    scope.launch {
+                        repository.log("VPN", "WARNING", "Previous session did not confirm teardown in time; reconnecting anyway.")
+                    }
+                }
             }
             repository.selectServer(server.id)
             startVpn(server)

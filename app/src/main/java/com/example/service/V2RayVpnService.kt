@@ -85,7 +85,29 @@ class V2RayVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
+
+        // FIX (Android 14+ crash): VpnCoreManager.stopVpnInternal() has to send
+        // ACTION_STOP through startForegroundService() on Android O+ because the
+        // service may already be stopped and a plain startService() would throw.
+        // But startForegroundService() creates a hard contract: the service MUST
+        // call startForeground() within ~5 seconds, otherwise the system kills
+        // the process with RemoteServiceException
+        // ("Context.startForegroundService() did not then call Service.startForeground()").
+        // The old code only called startForeground() on the START path — so
+        // every user-initiated disconnect on Android 14+ risked an app crash.
+        // Promote to foreground for BOTH actions before doing any real work.
+        enterForegroundNotification()
+
         if (action == ACTION_START) {
+            // Guard against a second START while a session is already running
+            // (e.g. a double-tap on the connect button): two concurrent
+            // sessions would spawn a second xray process that fails to bind
+            // port 10808 and race on the single TUN fd — a source of
+            // "connect / disconnect" flapping.
+            if (sessionJob?.isActive == true) {
+                Log.w("V2RayVpnService", "ACTION_START ignored: a VPN session is already active.")
+                return START_NOT_STICKY
+            }
             startVpn()
         } else if (action == ACTION_STOP) {
             stopVpn()
@@ -93,22 +115,21 @@ class V2RayVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
-    private fun startVpn() {
-        // NOTE: cleanupDone is NOT reset here anymore. It is reset inside the
-        // session coroutine, under cleanupMutex, so a new session can never
-        // start while the previous session's teardown is still in flight.
-
+    /**
+     * Promotes the service to foreground with the persistent notification.
+     * Safe to call repeatedly (e.g. on START followed by an in-flight STOP).
+     */
+    private fun enterForegroundNotification() {
         createNotificationChannel()
-        val intent = Intent(this, MainActivity::class.java)
-
-        val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
-
         val pendingIntent = PendingIntent.getActivity(
-            this, 0, intent, pendingIntentFlags
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            } else {
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
         )
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -120,6 +141,15 @@ class V2RayVpnService : VpnService() {
             .build()
 
         startForeground(NOTIFICATION_ID, notification)
+    }
+
+    private fun startVpn() {
+        // NOTE: cleanupDone is NOT reset here anymore. It is reset inside the
+        // session coroutine, under cleanupMutex, so a new session can never
+        // start while the previous session's teardown is still in flight.
+        //
+        // Foreground promotion already happened in onStartCommand() (required
+        // for the START_FOREGROUND contract on every code path).
 
         // Fresh session: any stop that comes later is against THIS session.
         intentionalStop = false
@@ -130,6 +160,7 @@ class V2RayVpnService : VpnService() {
             cleanupMutex.withLock { cleanupDone.set(false) }
 
             val db = V2RayDatabase.getDatabase(applicationContext)
+            V2RayRepository.initializeSettings(applicationContext)
             val repository = V2RayRepository(db)
             val server = repository.getSelectedServer()
 
@@ -313,13 +344,33 @@ class V2RayVpnService : VpnService() {
                  */
                 repository.log("TUNNEL", "INFO", "Xray SOCKS is ready; installing VPN interface...")
 
+                // Use the user-configured MTU (settings screen) instead of the
+                // hard-coded constant. It MUST be identical to the MTU written
+                // into hev's YAML below (hever's tun mtu), otherwise the TUN
+                // layer and the tunnel engine disagree on packet sizing and
+                // large packets get dropped silently -> stalled transfers.
+                val mtu = repository.getRuntimeSettings().mtu
+                    .coerceIn(1280, 1500)
+                repository.log("TUNNEL", "INFO", "Applying tunnel MTU: $mtu")
+
                 val builder = Builder()
                     .setSession("V2RayDan")
                     .addAddress("172.19.0.1", 30)
                     .addRoute("0.0.0.0", 0)
+                    // FIX (IPv6 leak / stalling): without an IPv6 address and
+                    // ::/0 route the TUN advertises no v6 connectivity, so apps
+                    // on v6-capable networks either bypass the tunnel (leak) or
+                    // wait on v6 happy-eyeballs timeouts before falling back.
+                    // hev-socks5-tunnel relays v6 over the same SOCKS loopback.
+                    .addAddress("fdfe:dcba:9876::1", 126)
+                    .addRoute("::", 0)
+                    // DNS servers offered to apps. They send UDP/53 to these
+                    // addresses; the packets enter TUN -> hev -> Xray's
+                    // dns-out, which answers via the split DNS config
+                    // (.ir -> domestic Shecan, rest -> 1.1.1.1 over tunnel).
+                    .addDnsServer("178.22.122.100")
                     .addDnsServer("1.1.1.1")
-                    .addDnsServer("8.8.8.8")
-                    .setMtu(HevSocks5Tunnel.TUNNEL_MTU)
+                    .setMtu(mtu)
 
                 try {
                     builder.addDisallowedApplication(packageName)
@@ -365,7 +416,8 @@ class V2RayVpnService : VpnService() {
                 val hevConfigFile = File(cacheDir, "hev_tunnel.yml")
                 HevSocks5Tunnel.writeConfig(
                     hevConfigFile,
-                    XrayConfigGenerator.SOCKS_INBOUND_PORT
+                    XrayConfigGenerator.SOCKS_INBOUND_PORT,
+                    mtu = mtu
                 )
 
                 hevTunnelThread = Thread({
