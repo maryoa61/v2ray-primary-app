@@ -364,12 +364,15 @@ class V2RayVpnService : VpnService() {
                     // hev-socks5-tunnel relays v6 over the same SOCKS loopback.
                     .addAddress("fdfe:dcba:9876::1", 126)
                     .addRoute("::", 0)
-                    // DNS servers offered to apps. They send UDP/53 to these
-                    // addresses; the packets enter TUN -> hev -> Xray's
-                    // dns-out, which answers via the split DNS config
-                    // (.ir -> domestic Shecan, rest -> 1.1.1.1 over tunnel).
+                    // DNS servers offered to apps. Apps send UDP/53 to these
+                    // addresses; the packets enter TUN -> hev -> Xray's socks
+                    // inbound -> port-53 routing rule -> dns-out, which answers
+                    // from the reachable domestic Shecan resolvers. Both
+                    // advertised servers are Shecan (primary/secondary) so no
+                    // app query ever targets 1.1.1.1 directly on the physical
+                    // link (which is blocked in Iran).
                     .addDnsServer("178.22.122.100")
-                    .addDnsServer("1.1.1.1")
+                    .addDnsServer("185.51.200.2")
                     .setMtu(mtu)
 
                 try {

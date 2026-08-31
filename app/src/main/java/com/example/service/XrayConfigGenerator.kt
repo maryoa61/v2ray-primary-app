@@ -83,35 +83,30 @@ object XrayConfigGenerator {
         // The regexp rules below already cover .ir domains without needing that category.
         val hasGeoip = filesDir != null && File(filesDir, "geoip.dat").exists()
 
-        // The DNS block references geoip/geosite-free plain IPs, so it is safe
-        // to emit unconditionally. Shecan resolvers handle .ir domains DIRECTLY
-        // (fast domestic DNS), while 1.1.1.1 is queried by Xray itself for
-        // everything else — but Xray's DNS server sockets are opened from the
-        // xray process whose UID is excluded from the VPN (addDisallowedApplication),
-        // so those queries go out on the physical link and can be polluted;
-        // this only affects Xray's own resolution for routing (domain rules are
-        // matched pre-resolution via sniffing), so it is harmless in practice.
+        // CRITICAL DNS FIX (learned from device logs in Iran):
+        // The xray process is EXCLUDED from the VPN (addDisallowedApplication),
+        // so every socket xray opens — including its own DNS queries — goes out
+        // on the PHYSICAL link. A public resolver like 1.1.1.1 / 8.8.8.8 is
+        // blocked on the Iranian physical link, so:
+        //   * resolving the PROXY SERVER's own domain (which can never go
+        //     through the tunnel — chicken-and-egg) timed out
+        //     ("dial tcp: lookup <server-domain>: operation was canceled"),
+        //   * and every foreign DNS query failed.
+        // Shecan (178.22.122.100 / 185.51.200.2) is a domestic resolver that
+        // IS reachable on the physical link and resolves BOTH .ir and foreign
+        // domains, so xray uses it for everything. Foreign-domain answers are
+        // harmless anyway: with sniffing + AsIs, proxied connections forward
+        // the sniffed DOMAIN to the remote server (which re-resolves), so the
+        // local answer is only used to reach the proxy and for DIRECT (.ir /
+        // private) traffic where Shecan is authoritative.
+        // The Shecan IPs are also pinned to the DIRECT routing rule below so
+        // xray's queries to them never try to enter the tunnel.
         val dnsBlock = """
           "dns": {
             "queryStrategy": "UseIPv4",
             "servers": [
-              {
-                "address": "$IR_DNS_PRIMARY",
-                "port": 53,
-                "domains": [
-                  "regexp:\\.ir$",
-                  "regexp:^[^.]*\\.ir$"
-                ]
-              },
-              {
-                "address": "$IR_DNS_SECONDARY",
-                "port": 53,
-                "domains": [
-                  "regexp:\\.ir$",
-                  "regexp:^[^.]*\\.ir$"
-                ]
-              },
-              "1.1.1.1"
+              "$IR_DNS_PRIMARY",
+              "$IR_DNS_SECONDARY"
             ]
           },
         """.trimIndent()
@@ -135,10 +130,10 @@ object XrayConfigGenerator {
         // for every connection, doubling DNS latency.
         //
         // The first rule sends all DNS (UDP/TCP 53) to the built-in dns-out:
-        // Xray answers queries locally using the split-DNS config above
-        // (.ir -> Shecan domestic, rest -> 1.1.1.1), and those Xray DNS
-        // client connections are in turn routed by the subsequent rules
-        // (Shecan IPs -> direct, see explicit IP list).
+        // Xray answers the intercepted queries locally using the reachable
+        // Shecan resolvers defined in the dns block, and xray's own sockets to
+        // Shecan are routed DIRECT (explicit IP list below) because the xray
+        // process is excluded from the VPN.
         val routingRules = """
           "routing": {
             "domainStrategy": "AsIs",

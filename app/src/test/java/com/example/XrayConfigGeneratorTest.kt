@@ -80,6 +80,17 @@ class XrayConfigGeneratorTest {
         // Shecan domestic resolvers for .ir domains
         assertTrue("shecan primary DNS", json.contains("178.22.122.100"))
         assertTrue("shecan secondary DNS", json.contains("185.51.200.2"))
+        // xray runs excluded from the VPN, so its own DNS goes out on the
+        // physical link. 1.1.1.1 / 8.8.8.8 are blocked there in Iran and made
+        // server-domain resolution time out — only Shecan IPs may appear.
+        assertFalse(
+            "1.1.1.1 must not be used as an xray resolver (blocked on direct link)",
+            json.contains("1.1.1.1")
+        )
+        assertFalse(
+            "8.8.8.8 must not be used as an xray resolver",
+            json.contains("8.8.8.8")
+        )
         // dns-out handles intercepted port-53 traffic
         assertTrue("dns-out outbound present", json.contains("\"dns-out\""))
         assertTrue(
