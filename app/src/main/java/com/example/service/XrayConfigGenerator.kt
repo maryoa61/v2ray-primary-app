@@ -47,6 +47,12 @@ object XrayConfigGenerator {
 
     const val SOCKS_INBOUND_PORT = 10808
 
+    // Iranian anti-sanction / domestic DNS resolvers (Shecan). Kept as
+    // constants because they must also be reachable DIRECTLY (not proxied),
+    // so they are injected into both the DNS config and the direct IP rules.
+    private const val IR_DNS_PRIMARY = "178.22.122.100"
+    private const val IR_DNS_SECONDARY = "185.51.200.2"
+
     // Xray-core has no "tun" inbound protocol — confirmed against the official
     // Xray-core source and infra/conf parser (unknown config / exit code 23 if
     // attempted). TUN termination is handled entirely outside Xray by
@@ -77,10 +83,67 @@ object XrayConfigGenerator {
         // The regexp rules below already cover .ir domains without needing that category.
         val hasGeoip = filesDir != null && File(filesDir, "geoip.dat").exists()
 
+        // CRITICAL DNS FIX (learned from device logs in Iran):
+        // The xray process is EXCLUDED from the VPN (addDisallowedApplication),
+        // so every socket xray opens — including its own DNS queries — goes out
+        // on the PHYSICAL link. A public resolver like 1.1.1.1 / 8.8.8.8 is
+        // blocked on the Iranian physical link, so:
+        //   * resolving the PROXY SERVER's own domain (which can never go
+        //     through the tunnel — chicken-and-egg) timed out
+        //     ("dial tcp: lookup <server-domain>: operation was canceled"),
+        //   * and every foreign DNS query failed.
+        // Shecan (178.22.122.100 / 185.51.200.2) is a domestic resolver that
+        // IS reachable on the physical link and resolves BOTH .ir and foreign
+        // domains, so xray uses it for everything. Foreign-domain answers are
+        // harmless anyway: with sniffing + AsIs, proxied connections forward
+        // the sniffed DOMAIN to the remote server (which re-resolves), so the
+        // local answer is only used to reach the proxy and for DIRECT (.ir /
+        // private) traffic where Shecan is authoritative.
+        // The Shecan IPs are also pinned to the DIRECT routing rule below so
+        // xray's queries to them never try to enter the tunnel.
+        val dnsBlock = """
+          "dns": {
+            "queryStrategy": "UseIPv4",
+            "servers": [
+              "$IR_DNS_PRIMARY",
+              "$IR_DNS_SECONDARY"
+            ]
+          },
+        """.trimIndent()
+
+        // CRITICAL FIX: hev-socks5-tunnel hands Xray raw destination IPs for
+        // every connection (the TUN layer sees IP packets; hev passes the IP
+        // literal through SOCKS). With sniffing disabled Xray never recovers
+        // the TLS SNI / HTTP Host / QUIC SNI, so the "*.ir goes direct" DOMAIN
+        // rule could NEVER match — every Iranian site was pulled through the
+        // overseas proxy. That is the root cause of the reported
+        // "connected but slow / some sites never load" behaviour.
+        //
+        // Enabling sniffing (with http+tls+quic override) restores the original
+        // hostname from the handshake so domain routing actually works. quic is
+        // needed for HTTP/3 traffic (Google/YouTube over UDP/443); UDP is
+        // already enabled on the inbound.
+        //
+        // domainStrategy is "AsIs": direct traffic is resolved by the client
+        // (via the VPN-configured domestic DNS) and proxied traffic by the
+        // remote server. "IPIfNonMatch" forced an extra edge-side resolution
+        // for every connection, doubling DNS latency.
+        //
+        // The first rule sends all DNS (UDP/TCP 53) to the built-in dns-out:
+        // Xray answers the intercepted queries locally using the reachable
+        // Shecan resolvers defined in the dns block, and xray's own sockets to
+        // Shecan are routed DIRECT (explicit IP list below) because the xray
+        // process is excluded from the VPN.
         val routingRules = """
           "routing": {
-            "domainStrategy": "IPIfNonMatch",
+            "domainStrategy": "AsIs",
             "rules": [
+              {
+                "type": "field",
+                "inboundTag": ["socks-in", "http-in"],
+                "outboundTag": "dns-out",
+                "port": 53
+              },
               {
                 "type": "field",
                 "outboundTag": "direct",
@@ -98,6 +161,8 @@ object XrayConfigGenerator {
                   "192.168.0.0/16",
                   "127.0.0.0/8",
                   "100.64.0.0/10",
+                  "$IR_DNS_PRIMARY",
+                  "$IR_DNS_SECONDARY",
                   "fc00::/7",
                   "fe80::/10"
                   ${if (hasGeoip) ",\"geoip:private\",\"geoip:ir\"" else ""}
@@ -117,6 +182,7 @@ object XrayConfigGenerator {
           "log": {
             "loglevel": "warning"
           },
+          $dnsBlock
           $routingRules
           "inbounds": [
             {
@@ -129,18 +195,19 @@ object XrayConfigGenerator {
                 "udp": true
               },
               "sniffing": {
-                "enabled": false,
-                "destOverride": ["http", "tls"]
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"]
               }
             },
             {
+              "tag": "http-in",
               "port": 10809,
               "listen": "127.0.0.1",
               "protocol": "http",
               "settings": {},
               "sniffing": {
-                "enabled": false,
-                "destOverride": ["http", "tls"]
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"]
               }
             }
           ],
@@ -150,6 +217,10 @@ object XrayConfigGenerator {
               "protocol": "freedom",
               "settings": {},
               "tag": "direct"
+            },
+            {
+              "protocol": "dns",
+              "tag": "dns-out"
             }
           ]
         }

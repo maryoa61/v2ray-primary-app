@@ -8,6 +8,10 @@ interface ServerDao {
     @Query("SELECT * FROM servers ORDER BY id DESC")
     fun getAllServers(): Flow<List<ServerEntity>>
 
+    /** One-shot snapshot for sync/dedup logic (Flow can't be used in writes). */
+    @Query("SELECT * FROM servers")
+    suspend fun getAllServersOnce(): List<ServerEntity>
+
     @Query("SELECT * FROM servers WHERE isSelected = 1 LIMIT 1")
     fun getSelectedServerFlow(): Flow<ServerEntity?>
 

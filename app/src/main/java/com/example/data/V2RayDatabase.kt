@@ -21,6 +21,21 @@ abstract class V2RayDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: V2RayDatabase? = null
 
+        // v1 -> v2: historical migration. The MIGRATION_2_3/MIGRATION_3_4
+        // chain was added without registering a 1->2 step, so users still on
+        // schema v1 (early installs) hit Room's
+        // "Migration didn't properly handle" IllegalStateException on update.
+        // v2 introduced the `ping` latency column; create it if missing.
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("ALTER TABLE servers ADD COLUMN ping INTEGER")
+                } catch (e: Exception) {
+                    // Column may already exist on partially-migrated DBs.
+                }
+            }
+        }
+
         // v2 -> v3: add pinnedCert column for TLS cert pinning (pcs param).
         // ALTER TABLE keeps ALL existing data intact.
         val MIGRATION_2_3 = object : Migration(2, 3) {
@@ -46,7 +61,7 @@ abstract class V2RayDatabase : RoomDatabase() {
                     V2RayDatabase::class.java,
                     "v2ray_dan_database"
                 )
-                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .fallbackToDestructiveMigration()
                     .build()
                 INSTANCE = instance

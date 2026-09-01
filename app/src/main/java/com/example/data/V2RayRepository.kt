@@ -184,9 +184,27 @@ class V2RayRepository(private val db: V2RayDatabase) {
                 }
 
                 if (parsedConfigs.isNotEmpty()) {
-                    serverDao.insertServers(parsedConfigs)
-                    parsedCount = parsedConfigs.size
-                    log("SUBSCRIPTION", "SUCCESS", "Successfully imported $parsedCount servers from subscription ${subscription.name}")
+                    // FIX: OnConflictStrategy.REPLACE keys on the auto-generated
+                    // row id, which is 0 for freshly parsed links, so every
+                    // sync INSERTED a brand-new row. Re-syncing a subscription
+                    // (or auto-sync + manual sync) created unlimited duplicate
+                    // entries for the same node — the list grew on every
+                    // refresh, the background auto-connector pinged every copy
+                    // every 20s (battery/data drain), and the user saw dozens
+                    // of identical profiles. Upsert on the natural key instead.
+                    val existing = serverDao.getAllServersOnce()
+                    val deduped = dedupeAgainstExisting(parsedConfigs, existing)
+                    if (deduped.isNotEmpty()) {
+                        serverDao.insertServers(deduped)
+                    }
+                    parsedCount = deduped.size
+                    val duplicatesSkipped = parsedConfigs.size - deduped.size
+                    log(
+                        "SUBSCRIPTION",
+                        "SUCCESS",
+                        "Sync finished for ${subscription.name}: $parsedCount new/updated server(s)" +
+                                if (duplicatesSkipped > 0) ", $duplicatesSkipped duplicate(s) skipped" else ""
+                    )
 
                     // Update subscription timestamp
                     subscriptionDao.insertSubscription(subscription.copy(lastUpdated = System.currentTimeMillis()))
@@ -296,15 +314,23 @@ class V2RayRepository(private val db: V2RayDatabase) {
                 }
                 val ps = json.optString("ps", "VMess Server")
                 val add = json.optString("add", "0.0.0.0")
-                val port = json.optInt("port", 443)
+                // FIX: some exporters (and hand-written links) encode "port" as
+                // a JSON string ("443"). optInt() returns 0/default for a
+                // String value, so the client tried port 0 -> immediate
+                // connect failure. Parse the raw token and coerce both forms.
+                val port = (json.opt("port")?.toString()?.trim()?.toIntOrNull() ?: 443)
+                    .coerceIn(1, 65535)
                 val id = json.optString("id", "")
-                val aid = json.optInt("aid", 0)
+                val aid = json.opt("aid")?.toString()?.trim()?.toIntOrNull() ?: 0
                 val net = json.optString("net", "tcp")
                 val path = json.optString("path", "")
                 val host = json.optString("host", "")
-                val tls = json.optString("tls", "") == "tls"
+                val tlsRaw = json.optString("tls", "")
+                val tls = tlsRaw.equals("tls", ignoreCase = true)
                 val sni = json.optString("sni", "")
                 val fingerprint = json.optString("fp", "")
+                val scy = json.optString("scy", "").ifEmpty { "auto" }
+                val alpn = json.optString("alpn", "")
 
                 return ServerEntity(
                     name = ps,
@@ -313,12 +339,14 @@ class V2RayRepository(private val db: V2RayDatabase) {
                     port = port,
                     uuid = id,
                     alterId = aid,
+                    security = scy,
                     network = net,
                     path = path,
                     host = host,
                     tls = tls,
                     sni = sni,
-                    fingerprint = fingerprint
+                    fingerprint = fingerprint,
+                    alpn = alpn
                 )
             } else if (trimmed.startsWith("ss://", true)) {
                 // ss://base64(method:password)@host:port#name  OR ss://method:password@host:port#name
@@ -412,6 +440,43 @@ class V2RayRepository(private val db: V2RayDatabase) {
             Log.e("V2RayRepository", "Error parsing share link: $link", e)
         }
         return null
+    }
+
+    /**
+     * Natural identity of a server config (everything that matters to the
+     * core connection). Two links that normalise to the same key describe the
+     * same endpoint even if their display name differs.
+     */
+    private fun naturalKey(s: ServerEntity): String =
+        listOf(
+            s.type.lowercase(),
+            s.address.trim().lowercase(),
+            s.port.toString(),
+            s.uuid.trim(),
+            s.network.trim().lowercase(),
+            s.sni.trim().lowercase(),
+            s.flow.trim().lowercase(),
+            s.publicKey.trim(),
+            s.shortId.trim()
+        ).joinToString("|")
+
+    /**
+     * Reuse the row id of an existing server with the same natural key so the
+     * upsert updates it instead of inserting a duplicate. When multiple
+     * incoming links share a key, only the first is kept.
+     */
+    private fun dedupeAgainstExisting(
+        incoming: List<ServerEntity>,
+        existing: List<ServerEntity>
+    ): List<ServerEntity> {
+        val keyToExistingId = existing.associate { naturalKey(it) to it.id }
+        val seenIncoming = HashSet<String>()
+        return incoming.mapNotNull { parsed ->
+            val key = naturalKey(parsed)
+            if (!seenIncoming.add(key)) return@mapNotNull null
+            val existingId = keyToExistingId[key]
+            if (existingId != null) parsed.copy(id = existingId) else parsed
+        }
     }
 
     private fun parseQueryParams(query: String): Map<String, String> {
