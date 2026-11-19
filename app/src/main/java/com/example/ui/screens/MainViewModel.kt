@@ -16,6 +16,8 @@ import com.example.service.AutoConnectService
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -209,18 +211,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun triggerPing(serverId: Long) {
         viewModelScope.launch {
-            _isTestingPing.update { it + (serverId to true) }
-            repository.testServerPing(serverId)
-            _isTestingPing.update { it + (serverId to false) }
+            testPingWithIndicator(serverId)
         }
     }
 
     fun pingAllServers() {
         viewModelScope.launch {
-            val list = servers.value
-            list.forEach { s ->
-                triggerPing(s.id)
+            val list = servers.value.toList()
+            coroutineScope {
+                list.forEach { server ->
+                    launch { testPingWithIndicator(server.id) }
+                }
             }
+        }
+    }
+
+    private suspend fun testPingWithIndicator(serverId: Long) {
+        _isTestingPing.update { it + (serverId to true) }
+        try {
+            repository.testServerPing(serverId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // The repository records failed probes and returns a timeout value.
+        } finally {
+            _isTestingPing.update { it + (serverId to false) }
         }
     }
 
@@ -272,6 +287,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setMtu(mtu: Int) { settings.value=settings.value.copy(mtu=mtu.coerceIn(1280,1500)); repository.saveRuntimeSettings(settings.value) }
     fun setHttpInboundEnabled(enabled: Boolean) { settings.value=settings.value.copy(httpInboundEnabled=enabled); repository.saveRuntimeSettings(settings.value) }
     fun setAutoConnectEnabled(enabled: Boolean) { settings.value=settings.value.copy(autoConnectEnabled=enabled); repository.saveRuntimeSettings(settings.value) }
+    fun setFragmentEnabled(enabled: Boolean) {
+        settings.value = settings.value.copy(fragmentEnabled = enabled)
+        repository.saveRuntimeSettings(settings.value)
+    }
+    fun setFragmentParameters(packets: String, length: String, interval: String, maxSplit: String) {
+        settings.value = settings.value.copy(
+            fragmentPackets = packets,
+            fragmentLength = length,
+            fragmentInterval = interval,
+            fragmentMaxSplit = maxSplit
+        )
+        repository.saveRuntimeSettings(settings.value)
+    }
     fun clearLogHistory() {
         viewModelScope.launch {
             repository.clearLogs()

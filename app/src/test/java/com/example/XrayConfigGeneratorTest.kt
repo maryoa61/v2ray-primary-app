@@ -2,7 +2,9 @@ package com.example
 
 import com.example.data.ServerEntity
 import com.example.service.HevSocks5Tunnel
+import com.example.service.RuntimeSettings
 import com.example.service.XrayConfigGenerator
+import com.example.service.effectiveDnsServers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -11,7 +13,7 @@ import java.io.File
 
 /**
  * Pure-JVM tests for the Xray/hev config that guards the tunnel stability
- * fixes (sniffing, split DNS, dns-out, MTU propagation).
+ * fixes (sniffing, proxied app DNS, encrypted bootstrap DoH, MTU propagation).
  *
  * These intentionally avoid org.json / Android so they run on the host JVM
  * with the plain unit-test runner.
@@ -57,10 +59,149 @@ class XrayConfigGeneratorTest {
         assertTrue("unbalanced brackets", balanced(json, '[', ']'))
     }
 
+    private fun outboundObject(json: String, tag: String): String {
+        val outboundsKey = json.indexOf("\"outbounds\"")
+        assertTrue("outbounds array is present", outboundsKey >= 0)
+        val arrayStart = json.indexOf('[', outboundsKey)
+        assertTrue("outbounds array starts", arrayStart >= 0)
+
+        var objectStart = -1
+        var objectDepth = 0
+        var inString = false
+        var escaped = false
+        for (index in arrayStart + 1 until json.length) {
+            val char = json[index]
+            if (inString) {
+                if (escaped) escaped = false
+                else if (char == '\\') escaped = true
+                else if (char == '"') inString = false
+                continue
+            }
+            when (char) {
+                '"' -> inString = true
+                '{' -> {
+                    if (objectDepth == 0) objectStart = index
+                    objectDepth++
+                }
+                '}' -> {
+                    objectDepth--
+                    if (objectDepth == 0 && objectStart >= 0) {
+                        val candidate = json.substring(objectStart, index + 1)
+                        if (candidate.contains("\"tag\": \"$tag\"")) return candidate
+                        objectStart = -1
+                    }
+                }
+                ']' -> if (objectDepth == 0) break
+            }
+        }
+        return ""
+    }
+
     @Test
     fun `config is structurally balanced`() {
         val json = XrayConfigGenerator.generate(sampleServer, filesDir = null)
         minimalJsonCheck(json)
+    }
+
+    @Test
+    fun `config supports isolated temporary inbound ports for real ping probes`() {
+        val json = XrayConfigGenerator.generate(
+            sampleServer,
+            filesDir = null,
+            socksPort = 45123,
+            httpPort = 45124
+        )
+        assertTrue(json.contains("\"port\": 45123"))
+        assertTrue(json.contains("\"port\": 45124"))
+    }
+
+    @Test
+    fun `fragment is opt-in and emits a compatible freedom dialer chain`() {
+        val defaultJson = XrayConfigGenerator.generate(sampleServer, filesDir = null)
+        assertFalse(defaultJson.contains("\"tag\": \"fragment\""))
+        assertFalse(defaultJson.contains("\"dialerProxy\": \"fragment\""))
+
+        val json = XrayConfigGenerator.generate(
+            sampleServer,
+            filesDir = null,
+            runtimeSettings = RuntimeSettings(
+                fragmentEnabled = true,
+                fragmentPackets = "tlshello",
+                fragmentLength = "60-150",
+                fragmentInterval = "7-15",
+                fragmentMaxSplit = "10"
+            )
+        )
+        minimalJsonCheck(json)
+        val proxyOutbound = outboundObject(json, "proxy")
+        val fragmentOutbound = outboundObject(json, "fragment")
+        assertTrue("main proxy outbound chains through fragment", proxyOutbound.contains("\"dialerProxy\": \"fragment\""))
+        assertTrue("fragment is a Freedom outbound", fragmentOutbound.contains("\"protocol\": \"freedom\""))
+        assertTrue(fragmentOutbound.contains("\"packets\": \"tlshello\""))
+        assertTrue(fragmentOutbound.contains("\"length\": \"60-150\""))
+        assertTrue(fragmentOutbound.contains("\"interval\": \"7-15\""))
+        assertTrue(fragmentOutbound.contains("\"maxSplit\": \"10\""))
+    }
+
+    @Test
+    fun `temporary ping config keeps the persisted fragment chain`() {
+        val json = XrayConfigGenerator.generate(
+            sampleServer,
+            filesDir = null,
+            socksPort = 45123,
+            httpPort = 45124,
+            runtimeSettings = RuntimeSettings(
+                fragmentEnabled = true,
+                fragmentPackets = "2-4",
+                fragmentLength = "60-120",
+                fragmentInterval = "5-12",
+                fragmentMaxSplit = "8"
+            )
+        )
+        minimalJsonCheck(json)
+        assertTrue(json.contains("\"port\": 45123"))
+        assertTrue(json.contains("\"port\": 45124"))
+        assertTrue(outboundObject(json, "proxy").contains("\"dialerProxy\": \"fragment\""))
+        assertTrue(outboundObject(json, "fragment").contains("\"packets\": \"2-4\""))
+    }
+
+    @Test
+    fun `tlshello fragment maps to first packets for reality`() {
+        val realityServer = sampleServer.copy(
+            tls = false,
+            security = "reality",
+            network = "tcp",
+            publicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            shortId = "abcd"
+        )
+        val json = XrayConfigGenerator.generate(
+            realityServer,
+            filesDir = null,
+            runtimeSettings = RuntimeSettings(fragmentEnabled = true)
+        )
+        minimalJsonCheck(json)
+        assertTrue(json.contains("\"packets\": \"1-3\""))
+        assertFalse(json.contains("\"packets\": \"tlshello\""))
+    }
+
+    @Test
+    fun `invalid fragment values fall back to safe defaults`() {
+        val json = XrayConfigGenerator.generate(
+            sampleServer,
+            filesDir = null,
+            runtimeSettings = RuntimeSettings(
+                fragmentEnabled = true,
+                fragmentPackets = "not-a-mode",
+                fragmentLength = "50-100\"}",
+                fragmentInterval = "-2",
+                fragmentMaxSplit = "0"
+            )
+        )
+        minimalJsonCheck(json)
+        assertTrue(json.contains("\"packets\": \"1-3\""))
+        assertTrue(json.contains("\"length\": \"50-100\""))
+        assertTrue(json.contains("\"interval\": \"10-20\""))
+        assertTrue(json.contains("\"maxSplit\": \"10\""))
     }
 
     @Test
@@ -74,29 +215,41 @@ class XrayConfigGeneratorTest {
     }
 
     @Test
-    fun `split DNS and dns-out outbound are present`() {
+    fun `app DNS stays on proxy and proxy hostname bootstrap uses encrypted DoH`() {
         val json = XrayConfigGenerator.generate(sampleServer, filesDir = null)
         assertTrue("dns block present", json.contains("\"dns\""))
-        // Shecan domestic resolvers for .ir domains
-        assertTrue("shecan primary DNS", json.contains("178.22.122.100"))
-        assertTrue("shecan secondary DNS", json.contains("185.51.200.2"))
-        // xray runs excluded from the VPN, so its own DNS goes out on the
-        // physical link. 1.1.1.1 / 8.8.8.8 are blocked there in Iran and made
-        // server-domain resolution time out — only Shecan IPs may appear.
-        assertFalse(
-            "1.1.1.1 must not be used as an xray resolver (blocked on direct link)",
-            json.contains("1.1.1.1")
+        assertTrue("bootstrap resolver uses encrypted direct DoH", json.contains("https+local://1.1.1.1/dns-query"))
+        assertTrue("proxy endpoint uses bootstrap-only DNS match", json.contains("full:node.example.com"))
+        assertTrue("fallback resolver uses routed DoH", json.contains("https://1.1.1.1/dns-query"))
+        assertTrue("second routed DoH endpoint is configured", json.contains("https://1.0.0.1/dns-query"))
+        assertFalse("plain domestic DNS resolvers must not be configured", json.contains("178.22.122.100"))
+        assertFalse("plain secondary DNS resolver must not be configured", json.contains("185.51.200.2"))
+        assertFalse("app DNS must not be hijacked by dns-out", json.contains("dns-out"))
+        assertFalse("there must be no special port-53 direct/hijack rule", json.contains("\"port\": 53"))
+        assertTrue("all ordinary TCP/UDP flows, including DNS, use proxy", json.contains("\"network\": \"tcp,udp\""))
+    }
+
+    @Test
+    fun `configured private DNS resolver is proxied before private network bypass`() {
+        val json = XrayConfigGenerator.generate(
+            sampleServer,
+            filesDir = null,
+            runtimeSettings = RuntimeSettings(dnsServers = listOf("192.168.1.1"))
         )
-        assertFalse(
-            "8.8.8.8 must not be used as an xray resolver",
-            json.contains("8.8.8.8")
-        )
-        // dns-out handles intercepted port-53 traffic
-        assertTrue("dns-out outbound present", json.contains("\"dns-out\""))
-        assertTrue(
-            "port 53 routed to dns-out",
-            json.contains("\"outboundTag\": \"dns-out\"")
-        )
+        val resolverIndex = json.indexOf("\"192.168.1.1\"")
+        val privateBypassIndex = json.indexOf("\"10.0.0.0/8\"")
+        val proxyRuleIndex = json.lastIndexOf("\"outboundTag\": \"proxy\"", resolverIndex)
+        assertTrue("resolver route exists", resolverIndex >= 0)
+        assertTrue("resolver is routed through proxy", proxyRuleIndex >= 0 && proxyRuleIndex < resolverIndex)
+        assertTrue("resolver proxy rule precedes private direct bypass", resolverIndex < privateBypassIndex)
+    }
+
+    @Test
+    fun `invalid DNS addresses fall back to numeric public resolvers`() {
+        val effectiveResolvers = RuntimeSettings(
+            dnsServers = listOf("resolver.example.com", "01.2.3.4", "256.1.1.1")
+        ).effectiveDnsServers()
+        assertEquals(listOf("1.1.1.1", "1.0.0.1"), effectiveResolvers)
     }
 
     @Test
@@ -108,12 +261,16 @@ class XrayConfigGeneratorTest {
     }
 
     @Test
-    fun `domestic DNS IPs are in the direct rule even without geoip`() {
+    fun `geoip is skipped when geoip dat is absent`() {
         // filesDir == null -> hasGeoip == false -> geoip entries omitted.
         val json = XrayConfigGenerator.generate(sampleServer, filesDir = null)
         assertFalse("geoip must be skipped without geoip.dat", json.contains("geoip"))
-        // But Shecan resolvers must still be forced direct by explicit IP rule.
-        assertTrue(json.contains("178.22.122.100"))
+    }
+
+    @Test
+    fun `IP proxy endpoints do not get a hostname bootstrap DNS rule`() {
+        val json = XrayConfigGenerator.generate(sampleServer.copy(address = "203.0.113.10"), filesDir = null)
+        assertFalse("IP endpoints do not need direct bootstrap DNS", json.contains("https+local://"))
     }
 
     @Test

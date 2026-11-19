@@ -1,21 +1,35 @@
 package com.example.data
 
 import android.content.Context
+import android.os.Build
 import android.util.Base64
 import android.util.Log
 import com.example.service.RuntimeSettings
+import com.example.service.XrayConfigGenerator
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.File
+import java.io.IOException
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import java.net.URLDecoder as JURLDecoder
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicReference
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 
 class V2RayRepository(private val db: V2RayDatabase) {
     private val serverDao = db.serverDao()
@@ -29,20 +43,47 @@ class V2RayRepository(private val db: V2RayDatabase) {
 
     companion object {
         @Volatile private var preferences: android.content.SharedPreferences? = null
-        fun initializeSettings(context: Context) { preferences = context.getSharedPreferences("runtime_settings", Context.MODE_PRIVATE) }
+        @Volatile private var appContext: Context? = null
+        private val realPingSemaphore = Semaphore(2)
+        private val xrayAssetsLock = Any()
+
+        fun initializeSettings(context: Context) {
+            val applicationContext = context.applicationContext
+            appContext = applicationContext
+            preferences = applicationContext.getSharedPreferences("runtime_settings", Context.MODE_PRIVATE)
+        }
     }
     fun getRuntimeSettings(): RuntimeSettings {
         val p = preferences ?: return RuntimeSettings()
         return RuntimeSettings(
-            dnsServers = p.getString("dnsServers", "1.1.1.1")!!.split(",").map { it.trim() }.filter { it.isNotEmpty() },
+            dnsServers = p.getString("dnsServers", "1.1.1.1,1.0.0.1")!!.split(",").map { it.trim() }.filter { it.isNotEmpty() },
             routingMode = p.getString("routingMode", "Bypass LAN & Mainland")!!,
             mtu = p.getInt("mtu", 1400),
             httpInboundEnabled = p.getBoolean("httpInboundEnabled", false),
             bypassList = p.getString("bypassList", "")!!.split(",").map { it.trim() }.filter { it.isNotEmpty() },
-            autoConnectEnabled = p.getBoolean("autoConnectEnabled", false)
+            autoConnectEnabled = p.getBoolean("autoConnectEnabled", false),
+            fragmentEnabled = p.getBoolean("fragmentEnabled", false),
+            fragmentPackets = p.getString("fragmentPackets", "tlshello") ?: "tlshello",
+            fragmentLength = p.getString("fragmentLength", "50-100") ?: "50-100",
+            fragmentInterval = p.getString("fragmentInterval", "10-20") ?: "10-20",
+            fragmentMaxSplit = p.getString("fragmentMaxSplit", "10") ?: "10"
         )
     }
-    fun saveRuntimeSettings(settings: RuntimeSettings) { preferences?.edit()?.putString("dnsServers", settings.dnsServers.joinToString(","))?.putString("routingMode", settings.routingMode)?.putInt("mtu", settings.mtu)?.putBoolean("httpInboundEnabled", settings.httpInboundEnabled)?.putString("bypassList", settings.bypassList.joinToString(","))?.putBoolean("autoConnectEnabled", settings.autoConnectEnabled)?.apply() }
+    fun saveRuntimeSettings(settings: RuntimeSettings) {
+        preferences?.edit()
+            ?.putString("dnsServers", settings.dnsServers.joinToString(","))
+            ?.putString("routingMode", settings.routingMode)
+            ?.putInt("mtu", settings.mtu)
+            ?.putBoolean("httpInboundEnabled", settings.httpInboundEnabled)
+            ?.putString("bypassList", settings.bypassList.joinToString(","))
+            ?.putBoolean("autoConnectEnabled", settings.autoConnectEnabled)
+            ?.putBoolean("fragmentEnabled", settings.fragmentEnabled)
+            ?.putString("fragmentPackets", settings.fragmentPackets)
+            ?.putString("fragmentLength", settings.fragmentLength)
+            ?.putString("fragmentInterval", settings.fragmentInterval)
+            ?.putString("fragmentMaxSplit", settings.fragmentMaxSplit)
+            ?.apply()
+    }
 
     suspend fun getSelectedServer(): ServerEntity? = serverDao.getSelectedServer()
 
@@ -105,36 +146,238 @@ class V2RayRepository(private val db: V2RayDatabase) {
         logDao.clearLogs()
     }
 
-    // Ping a server using a real TCP socket connection check!
-    suspend fun testServerPing(serverId: Long): Int = withContext(Dispatchers.IO) {
-        val server = serverDao.getServerById(serverId) ?: return@withContext -1
-        val start = System.currentTimeMillis()
-        var pingResult = -1
-        var socket: Socket? = null
-        try {
-            socket = Socket()
-            // We use standard handshake timeout of 1200ms
-            socket.connect(InetSocketAddress(server.address, server.port), 1200)
-            val end = System.currentTimeMillis()
-            pingResult = (end - start).toInt()
-            serverDao.updatePing(serverId, pingResult)
-            log("PING", "SUCCESS", "Ping response from ${server.name}: ${pingResult}ms")
-        } catch (e: Exception) {
-            log(
-                "PING",
-                "ERROR",
-                "Failed to ping ${server.name} (${server.address}:${server.port}): ${e.localizedMessage}"
-            )
-            serverDao.updatePing(serverId, -2) // -2 indicates timeout/unreachable
-            pingResult = -2
-        } finally {
+    /**
+     * Measures an actual request through the server's Xray configuration.
+     * A raw TCP connect to address:port only checks whether a port is open; it
+     * does not verify TLS/REALITY, credentials, transport, or proxy forwarding.
+     */
+    suspend fun testServerPing(serverId: Long): Int = realPingSemaphore.withPermit {
+        withContext(Dispatchers.IO) {
+            val server = serverDao.getServerById(serverId) ?: return@withContext -1
+            val context = appContext
+            if (context == null) {
+                serverDao.updatePing(serverId, -2)
+                log("PING", "ERROR", "Cannot test ${server.name}: application context is unavailable.")
+                return@withContext -2
+            }
+
+            var process: Process? = null
+            var configFile: File? = null
             try {
-                socket?.close()
+                prepareXrayAssets(context)
+                val binary = File(context.applicationInfo.nativeLibraryDir, "libxray.so")
+                if (!binary.exists() || binary.length() <= 1_000_000L) {
+                    throw IOException("Xray executable is missing from the installed app.")
+                }
+
+                val socksPort = availableLocalPort()
+                var httpPort = availableLocalPort()
+                while (httpPort == socksPort) httpPort = availableLocalPort()
+                val generatedConfigFile = File(context.cacheDir, "xray_ping_${server.id}_$socksPort.json")
+                configFile = generatedConfigFile
+                generatedConfigFile.writeText(
+                    XrayConfigGenerator.generate(
+                        server = server,
+                        filesDir = context.filesDir,
+                        socksPort = socksPort,
+                        httpPort = httpPort,
+                        runtimeSettings = getRuntimeSettings()
+                    )
+                )
+
+                val processBuilder = ProcessBuilder(
+                    binary.absolutePath,
+                    "-config",
+                    generatedConfigFile.absolutePath
+                ).redirectErrorStream(true)
+                processBuilder.environment()["XRAY_LOCATION_ASSET"] = context.filesDir.absolutePath
+                processBuilder.environment()["V2RAY_LOCATION_ASSET"] = context.filesDir.absolutePath
+                val runningProcess = processBuilder.start()
+                process = runningProcess
+
+                val lastCoreError = AtomicReference<String?>(null)
+                Thread({
+                    try {
+                        runningProcess.inputStream.bufferedReader().useLines { lines ->
+                            lines.forEach { line ->
+                                if (line.contains("error", ignoreCase = true)) {
+                                    lastCoreError.set(line.take(300))
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                        // The process may be intentionally terminated after the probe.
+                    }
+                }, "xray-ping-log-${server.id}").apply {
+                    isDaemon = true
+                    start()
+                }
+
+                val socksReady = runInterruptible(Dispatchers.IO) {
+                    waitForSocks(runningProcess, socksPort, timeoutMs = 8_000L)
+                }
+                if (!socksReady) {
+                    throw IOException(
+                        lastCoreError.get() ?: "Xray SOCKS inbound did not start for this configuration."
+                    )
+                }
+
+                val latencyMs = runInterruptible(Dispatchers.IO) {
+                    measureHttpsThroughSocks(socksPort, timeoutMs = 8_000L)
+                }
+                serverDao.updatePing(serverId, latencyMs)
+                log("PING", "SUCCESS", "Real proxy test for ${server.name}: ${latencyMs}ms")
+                latencyMs
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Log.w("V2RayRepository", "Failed to close socket", e)
+                serverDao.updatePing(serverId, -2)
+                log(
+                    "PING",
+                    "ERROR",
+                    "Real proxy test failed for ${server.name} (${server.address}:${server.port}): " +
+                            (e.localizedMessage ?: e.javaClass.simpleName)
+                )
+                -2
+            } finally {
+                process?.let { running ->
+                    running.destroy()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && running.isAlive) {
+                        running.destroyForcibly()
+                    }
+                }
+                configFile?.delete()
             }
         }
-        return@withContext pingResult
+    }
+
+    private fun prepareXrayAssets(context: Context) {
+        synchronized(xrayAssetsLock) {
+            listOf("geoip.dat", "geosite.dat").forEach { name ->
+                val destination = File(context.filesDir, name)
+                if (!destination.exists() || destination.length() == 0L) {
+                    try {
+                        context.assets.open(name).use { input ->
+                            destination.outputStream().use { output -> input.copyTo(output) }
+                        }
+                    } catch (_: Exception) {
+                        // These assets are optional for the generated routing rules.
+                    }
+                }
+            }
+        }
+    }
+
+    private fun availableLocalPort(): Int = ServerSocket(0).use { it.localPort }
+
+    private fun isProcessAlive(process: Process): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) return process.isAlive
+        return try {
+            process.exitValue()
+            false
+        } catch (_: IllegalThreadStateException) {
+            true
+        }
+    }
+
+    private fun waitForSocks(process: Process, port: Int, timeoutMs: Long): Boolean {
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
+        while (System.nanoTime() < deadline) {
+            if (!isProcessAlive(process)) return false
+            try {
+                Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 150) }
+                return true
+            } catch (e: InterruptedException) {
+                throw e
+            } catch (e: Exception) {
+                if (Thread.currentThread().isInterrupted) {
+                    throw InterruptedException("Xray ping probe was cancelled.").apply { initCause(e) }
+                }
+                try {
+                    Thread.sleep(100)
+                } catch (interrupted: InterruptedException) {
+                    throw interrupted
+                }
+            }
+        }
+        return false
+    }
+
+    private fun measureHttpsThroughSocks(socksPort: Int, timeoutMs: Long): Int {
+        val endpoints = listOf(
+            "www.gstatic.com" to "/generate_204",
+            "cp.cloudflare.com" to "/generate_204"
+        )
+        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
+        val deadlineNanos = System.nanoTime() + timeoutMs * 1_000_000L
+        fun operationTimeoutMs(): Int {
+            val remainingMs = (deadlineNanos - System.nanoTime()) / 1_000_000L
+            if (remainingMs <= 0) throw IOException("HTTPS probe exceeded its ${timeoutMs}ms deadline.")
+            return minOf(4_000L, remainingMs).toInt().coerceAtLeast(1)
+        }
+
+        var lastFailure: Exception? = null
+
+        for ((host, path) in endpoints) {
+            var rawSocket: Socket? = null
+            var tlsSocket: SSLSocket? = null
+            try {
+                if (Thread.currentThread().isInterrupted) {
+                    throw InterruptedException("Xray ping probe was cancelled.")
+                }
+                rawSocket = Socket(proxy)
+                val startNanos = System.nanoTime()
+                rawSocket.connect(InetSocketAddress.createUnresolved(host, 443), operationTimeoutMs())
+                val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                tlsSocket = sslFactory
+                    .createSocket(rawSocket, host, 443, true) as SSLSocket
+                tlsSocket.soTimeout = operationTimeoutMs()
+                tlsSocket.startHandshake()
+                if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(host, tlsSocket.session)) {
+                    throw IOException("TLS hostname verification failed for $host")
+                }
+
+                val request = "GET $path HTTP/1.1\r\n" +
+                        "Host: $host\r\n" +
+                        "User-Agent: V2RayDan-Config-Test\r\n" +
+                        "Cache-Control: no-cache\r\n" +
+                        "Connection: close\r\n\r\n"
+                tlsSocket.outputStream.write(request.toByteArray(StandardCharsets.US_ASCII))
+                tlsSocket.outputStream.flush()
+                tlsSocket.soTimeout = operationTimeoutMs()
+                val statusLine = BufferedReader(
+                    InputStreamReader(tlsSocket.inputStream, StandardCharsets.US_ASCII)
+                ).use { it.readLine() ?: throw IOException("HTTPS probe returned an empty response") }
+                val responseCode = statusLine.split(' ').getOrNull(1)?.toIntOrNull()
+                    ?: throw IOException("Invalid HTTPS response: ${statusLine.take(120)}")
+                val elapsedMs = ((System.nanoTime() - startNanos) / 1_000_000L)
+                    .toInt()
+                    .coerceAtLeast(1)
+                if (responseCode in 200..399) return elapsedMs
+                lastFailure = IOException("Probe returned HTTP $responseCode")
+            } catch (e: InterruptedException) {
+                throw e
+            } catch (e: Exception) {
+                if (Thread.currentThread().isInterrupted) {
+                    throw InterruptedException("Xray ping probe was cancelled.").apply { initCause(e) }
+                }
+                lastFailure = e
+            } finally {
+                try {
+                    tlsSocket?.close()
+                } catch (_: Exception) {
+                }
+                try {
+                    rawSocket?.close()
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        throw IOException(
+            "No HTTPS probe succeeded${lastFailure?.localizedMessage?.let { ": $it" }.orEmpty()}",
+            lastFailure
+        )
     }
 
     // Real subscription import and link parsing!

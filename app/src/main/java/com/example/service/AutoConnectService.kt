@@ -18,10 +18,9 @@ import kotlinx.coroutines.sync.withPermit
  * fastest healthy node.
  *
  * Stability fixes in this revision:
- *  - Pings run CONCURRENTLY (bounded) instead of serially. The old loop ran
- *    one TCP connect (up to 1200 ms timeout) per server on a single
- *    coroutine; with 30+ duplicate subscription entries each round took tens
- *    of seconds, and the constant churn kept the radio active (battery/data).
+ *  - Real profile probes run concurrently but are bounded to two Xray
+ *    processes at a time. Unlike the old bare TCP-connect check, each probe
+ *    starts the selected profile and verifies an HTTPS request through SOCKS.
  *  - The interval is 30 s (was 20 s) and pings only start while the VPN is
  *    actually connected — pinging from a disconnected state is useless and
  *    still woke the radio.
@@ -39,7 +38,7 @@ class AutoConnectService : Service() {
 
     companion object {
         private const val PING_INTERVAL_MS = 30_000L
-        private const val MAX_CONCURRENT_PINGS = 6
+        private const val MAX_CONCURRENT_PINGS = 2
         private const val LATENCY_SWITCH_THRESHOLD_MS = 80
         private const val HEALTH_FAILURES_REQUIRED = 2
         private val _isServiceActive = MutableStateFlow(false)
@@ -84,8 +83,9 @@ class AutoConnectService : Service() {
                     if (connected) {
                         val servers = repository.allServers.first()
 
-                        // Concurrent bounded pings. testServerPing() is already
-                        // on Dispatchers.IO; the semaphore caps socket churn.
+                        // Concurrent bounded real profile probes. The repository
+                        // also applies the same global cap across UI and service
+                        // requests, preventing excessive Xray process creation.
                         coroutineScope {
                             servers.forEach { server ->
                                 launch {

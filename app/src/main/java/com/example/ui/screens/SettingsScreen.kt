@@ -20,12 +20,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.sp
 import com.example.data.SubscriptionEntity
 import com.example.ui.theme.*
@@ -40,9 +42,35 @@ fun SettingsScreen(
     val subscriptions by viewModel.subscriptions.collectAsState()
     val routingMode by viewModel.routingMode.collectAsState()
     val dnsServer by viewModel.dnsServer.collectAsState()
+    val runtimeSettings by viewModel.runtimeSettings.collectAsState()
 
     var showAddSubscription by remember { mutableStateOf(false) }
     var tempDnsText by remember { mutableStateOf(dnsServer) }
+    var fragmentExpanded by remember { mutableStateOf(true) }
+    var fragmentEditField by remember { mutableStateOf<String?>(null) }
+    var fragmentEditValue by remember { mutableStateOf("") }
+    fun isValidRange(value: String, minValue: Int, maxValue: Int, requireRange: Boolean = false): Boolean {
+        val parts = value.trim().split('-')
+        if (parts.size !in 1..2 || (requireRange && parts.size != 2)) return false
+        val from = parts[0].trim().toIntOrNull() ?: return false
+        val to = if (parts.size == 1) from else parts[1].trim().toIntOrNull() ?: return false
+        return from in minValue..maxValue && to in from..maxValue
+    }
+    val fragmentEditValid = when (fragmentEditField) {
+        "packets" -> fragmentEditValue.equals("tlshello", ignoreCase = true) ||
+            isValidRange(fragmentEditValue, minValue = 1, maxValue = 100, requireRange = true)
+        "length" -> isValidRange(fragmentEditValue, minValue = 1, maxValue = 65_535)
+        "interval" -> isValidRange(fragmentEditValue, minValue = 0, maxValue = 60_000)
+        "maxSplit" -> fragmentEditValue.toIntOrNull()?.let { it in 1..1_024 } == true
+        else -> false
+    }
+    val fragmentEditLabel = when (fragmentEditField) {
+        "packets" -> "بسته‌های مورد استفاده برای قطعه‌بندی (Fragment)"
+        "length" -> "طول قطعه (حداقل-حداکثر)"
+        "interval" -> "فاصله قطعه‌ها (حداقل-حداکثر)"
+        "maxSplit" -> "حداکثر تعداد قطعه‌ها"
+        else -> "تنظیم Fragment"
+    }
 
     val scrollState = rememberScrollState()
 
@@ -183,6 +211,11 @@ fun SettingsScreen(
                 }
             }
         }
+        Text(
+            "App DNS queries use this numeric IPv4 resolver through the proxy tunnel. For domain-based proxy hosts, Xray bootstraps the server address separately with direct, encrypted Cloudflare DoH (1.1.1.1:443); this setting does not change that resolver, and it must be reachable before the tunnel starts. A private LAN resolver may not be reachable from the proxy server.",
+            fontSize = 11.sp,
+            color = SlateTextSecondary
+        )
 
         // Section 3: Subscription Feeds Control
         Row(
@@ -241,6 +274,106 @@ fun SettingsScreen(
             }
         }
 
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("fragment_settings_section"),
+                colors = CardDefaults.cardColors(containerColor = SlateSurface),
+                border = CardDefaults.outlinedCardBorder(),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { fragmentExpanded = !fragmentExpanded }
+                            .padding(vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "تنظیمات قطعه‌بندی بسته‌ها (Fragment)",
+                            modifier = Modifier.weight(1f),
+                            color = SlateTextPrimary,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            textAlign = TextAlign.Start
+                        )
+                        Icon(
+                            imageVector = if (fragmentExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            contentDescription = if (fragmentExpanded) "بستن تنظیمات Fragment" else "باز کردن تنظیمات Fragment",
+                            tint = SlateTextSecondary
+                        )
+                    }
+                    AnimatedVisibility(visible = fragmentExpanded) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "فعال کردن Fragment",
+                                    modifier = Modifier.weight(1f),
+                                    color = SlateTextPrimary,
+                                    fontSize = 15.sp,
+                                    textAlign = TextAlign.Start
+                                )
+                                Switch(
+                                    checked = runtimeSettings.fragmentEnabled,
+                                    onCheckedChange = viewModel::setFragmentEnabled,
+                                    modifier = Modifier.testTag("fragment_enabled_toggle")
+                                )
+                            }
+                            FragmentValueRow(
+                                label = "بسته‌های مورد استفاده برای قطعه‌بندی (Fragment)",
+                                value = runtimeSettings.fragmentPackets,
+                                testTag = "fragment_packets_row"
+                            ) {
+                                fragmentEditField = "packets"
+                                fragmentEditValue = runtimeSettings.fragmentPackets
+                            }
+                            FragmentValueRow(
+                                label = "طول قطعه (حداقل-حداکثر)",
+                                value = runtimeSettings.fragmentLength,
+                                testTag = "fragment_length_row"
+                            ) {
+                                fragmentEditField = "length"
+                                fragmentEditValue = runtimeSettings.fragmentLength
+                            }
+                            FragmentValueRow(
+                                label = "فاصله قطعه‌ها (حداقل-حداکثر)",
+                                value = runtimeSettings.fragmentInterval,
+                                testTag = "fragment_interval_row"
+                            ) {
+                                fragmentEditField = "interval"
+                                fragmentEditValue = runtimeSettings.fragmentInterval
+                            }
+                            FragmentValueRow(
+                                label = "حداکثر تعداد قطعه‌ها",
+                                value = runtimeSettings.fragmentMaxSplit,
+                                testTag = "fragment_max_split_row"
+                            ) {
+                                fragmentEditField = "maxSplit"
+                                fragmentEditValue = runtimeSettings.fragmentMaxSplit
+                            }
+                            Text(
+                                "برای اعمال تنظیمات، پس از ذخیره اتصال را دوباره برقرار کنید.",
+                                modifier = Modifier.fillMaxWidth(),
+                                color = SlateTextSecondary,
+                                fontSize = 11.sp,
+                                textAlign = TextAlign.Start
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
     }
 
@@ -251,6 +384,90 @@ fun SettingsScreen(
                 viewModel.addSubscriptionUrl(name, url)
                 showAddSubscription = false
             }
+        )
+    }
+
+    if (fragmentEditField != null) {
+        val field = fragmentEditField
+        val helper = when (field) {
+            "packets" -> "tlshello یا بازه‌ای مانند 1-3"
+            "length" -> "عدد یا بازه‌ای مانند 50-100"
+            "interval" -> "عدد یا بازه‌ای مانند 10-20"
+            else -> "عدد بین 1 تا 1024"
+        }
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+            AlertDialog(
+                onDismissRequest = { fragmentEditField = null },
+                title = { Text("ویرایش $fragmentEditLabel", textAlign = TextAlign.Start) },
+                text = {
+                    OutlinedTextField(
+                        value = fragmentEditValue,
+                        onValueChange = { fragmentEditValue = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text(fragmentEditLabel) },
+                        supportingText = { Text(helper) },
+                        isError = !fragmentEditValid,
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = CyberCyan,
+                            unfocusedBorderColor = SlateBorder
+                        )
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        enabled = fragmentEditValid,
+                        onClick = {
+                            if (field != null && fragmentEditValid) {
+                                viewModel.setFragmentParameters(
+                                    packets = if (field == "packets") fragmentEditValue.trim() else runtimeSettings.fragmentPackets,
+                                    length = if (field == "length") fragmentEditValue.trim() else runtimeSettings.fragmentLength,
+                                    interval = if (field == "interval") fragmentEditValue.trim() else runtimeSettings.fragmentInterval,
+                                    maxSplit = if (field == "maxSplit") fragmentEditValue.trim() else runtimeSettings.fragmentMaxSplit
+                                )
+                                fragmentEditField = null
+                            }
+                        }
+                    ) { Text("ذخیره") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { fragmentEditField = null }) { Text("انصراف") }
+                },
+                containerColor = SlateSurface,
+                titleContentColor = SlateTextPrimary,
+                textContentColor = SlateTextPrimary
+            )
+        }
+    }
+}
+
+@Composable
+private fun FragmentValueRow(
+    label: String,
+    value: String,
+    testTag: String,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 9.dp)
+            .testTag(testTag),
+        horizontalAlignment = Alignment.Start
+    ) {
+        Text(
+            text = label,
+            color = SlateTextPrimary,
+            fontSize = 14.sp,
+            textAlign = TextAlign.Start
+        )
+        Text(
+            text = value,
+            color = SlateTextSecondary,
+            fontSize = 12.sp,
+            textAlign = TextAlign.Start
         )
     }
 }

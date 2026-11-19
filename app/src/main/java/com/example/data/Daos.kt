@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface ServerDao {
-    @Query("SELECT * FROM servers ORDER BY id DESC")
+    @Query("SELECT * FROM servers ORDER BY CASE WHEN ping IS NULL OR ping < 0 THEN 1 ELSE 0 END ASC, ping ASC, id DESC")
     fun getAllServers(): Flow<List<ServerEntity>>
 
     /** One-shot snapshot for sync/dedup logic (Flow can't be used in writes). */

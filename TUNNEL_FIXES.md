@@ -15,18 +15,32 @@ foreign site still worked, which masked the bug.
 - Enabled sniffing with `destOverride: ["http","tls","quic"]` on both inbounds
   (quic needed for HTTP/3 over UDP/443).
 - `domainStrategy` changed from `IPIfNonMatch` to `AsIs` — the former forced
-  an extra edge-side DNS resolution for every connection (extra RTT); `AsIs`
-  lets direct traffic resolve locally and proxied traffic resolve remotely.
+  an extra Xray-side IP lookup for unmatched connections. `AsIs` avoids that
+  lookup; sniffing recovers hostnames so the `.ir` rule can select the direct
+  outbound. App DNS queries remain separately routed through the proxy.
 
-## 2. DNS took a round-trip through the tunnel for every query (MAJOR)
+## 2. Plaintext DNS escaped the tunnel (MAJOR)
 **File:** `service/XrayConfigGenerator.kt`, `service/V2RayVpnService.kt`
-- Added a split DNS config: `.ir` domains → Shecan domestic resolvers
-  (`178.22.122.100` / `185.51.200.2`), everything else → `1.1.1.1`.
-- Added a `dns-out` outbound and a routing rule sending all port-53 traffic
-  from the inbounds to it, so apps' DNS queries are answered inside Xray.
-- VPN builder now advertises Shecan + 1.1.1.1 as DNS servers; the Shecan
-  resolver IPs are also pinned in the **direct** IP rule so they are never
-  proxied.
+The previous `dns-out` interception sent the Xray resolver queries to Shecan
+over plaintext UDP/53 on the physical network. The Xray process is excluded
+from the VPN, so pinning those resolver IPs to `direct` exposed DNS queries
+outside the proxy.
+- Removed the port-53 → `dns-out` rule and the direct Shecan IP exceptions.
+  App DNS requests now remain normal UDP/TCP flows and match the final `proxy`
+  routing rule.
+- Xray's own resolver uses DoH. The proxy endpoint's hostname has a dedicated
+  direct-DoH bootstrap match to avoid a proxy/DNS circular dependency; other
+  Xray DNS lookups use routed DoH. The bootstrap uses Xray `https+local` and
+  therefore reaches Cloudflare `1.1.1.1:443` directly over encrypted HTTPS; it
+  is not plaintext DNS, but the resolver can see the proxy hostname and this
+  endpoint must be reachable before the tunnel starts.
+- The VPN builder now advertises the user's numeric IPv4 DNS settings (defaults
+  `1.1.1.1` and `1.0.0.1`) instead of hardcoded Shecan addresses.
+- The advertised resolver list is validated and normalized once, then shared
+  with Xray. A resolver-specific `proxy` routing rule precedes private/LAN
+  bypass rules, preventing a user-selected router DNS address from escaping to
+  the physical network. Private LAN resolvers may consequently be unreachable
+  from the remote proxy and should be replaced with a public resolver.
 
 ## 3. Android 14+ crash on disconnect (`startForeground` contract)
 **File:** `service/V2RayVpnService.kt`
@@ -91,8 +105,15 @@ failure. Parsing now coerces both string and number forms and clamps to
 
 ## 10. Auto-connect background loop reworked
 **File:** `service/AutoConnectService.kt`
-- Pings now run concurrently (bounded semaphore) instead of serially with up
-  to 1.2 s each — with many servers a round took tens of seconds.
+- A ping test now starts the real Xray profile on temporary local ports and
+  measures an HTTPS request through its SOCKS inbound; it no longer treats a
+  bare TCP connect to the server port as a successful proxy test.
+- Probes run with a bounded global concurrency of two. Successful profiles
+  are automatically ordered by measured latency, with failed/unmeasured nodes
+  below them.
+- Each HTTPS probe has an 8 s total deadline; blocking SOCKS/HTTPS work is
+  interruptible so cancelling a queued or running test reaches process/socket
+  cleanup instead of leaving Xray alive through all endpoint timeouts.
 - Interval 20 s → 30 s; pinging skipped entirely while disconnected.
 - Switching requires the current node to be unreachable for 2 consecutive
   rounds AND a healthy candidate ≥80 ms faster, preventing restart storms
@@ -103,9 +124,35 @@ failure. Parsing now coerces both string and number forms and clamps to
 The migration chain started at 2→3; users on schema v1 crashed on update with
 Room's "Migration didn't properly handle" exception. Added `MIGRATION_1_2`.
 
+## 12. Optional anti-censorship TLS fragmentation
+**Files:** `service/XrayConfigGenerator.kt`, `service/RuntimeSettings.kt`, `ui/screens/SettingsScreen.kt`
+Added an opt-in, Persian RTL accordion at the bottom of the Settings page, with
+the enable switch and four value rows matching the supplied layout. Rows open
+validated edit dialogs. Defaults are `tlshello`, length `50-100`, interval
+`10-20` ms, and max split `10`. Settings are persisted; the user reconnects to
+regenerate the active Xray config. The proxy outbound uses
+`sockopt.dialerProxy: "fragment"` and a separate Freedom outbound carrying the
+Fragment parameters, matching the legacy schema supported by the bundled Xray
+v26.3.27. REALITY profiles translate `tlshello` to `1-3` to avoid breaking the
+handshake. Invalid persisted values fall back to safe defaults.
+
+## 13. First-launch notification permission
+**File:** `MainActivity.kt`
+On Android 13+, the app requests `POST_NOTIFICATIONS` on first launch and
+remembers a successfully launched request so the permission dialog is not
+repeated on every open. If launching the system permission flow fails, the
+request is not marked complete and can be retried on a later launch. Older
+Android versions skip the runtime permission request.
+
 ## Tests added
 - `app/src/test/java/com/example/XrayConfigGeneratorTest.kt` — validates config
-  structure, sniffing enabled, split DNS + dns-out, `AsIs` strategy, geoip
-  gating, hev MTU propagation/clamping/stack-size.
+  structure, sniffing enabled, proxied app DNS + encrypted bootstrap DoH,
+  resolver routing before private-network bypass and invalid DNS fallback,
+  temporary ping-probe ports, `AsIs` strategy, geoip gating, hev MTU
+  propagation/clamping/stack-size, and opt-in Fragment, user parameters,
+  malformed-value fallback, and REALITY mapping.
 - `app/src/test/java/com/example/ShareLinkParseTest.kt` — Robolectric tests for
   VMess string/numeric port, VLESS REALITY keys, invalid links.
+- `app/src/test/java/com/example/ServerAndFragmentSettingsIntegrationTest.kt` —
+  verifies live Room ordering after updated latency results and Fragment
+  SharedPreferences values flowing into a temporary ping-tunnel config.

@@ -205,7 +205,12 @@ class V2RayVpnService : VpnService() {
                     repository.log("SYSTEM", "WARNING", "Databases sync error: ${e.localizedMessage}")
                 }
 
-                val configJson = XrayConfigGenerator.generate(server, filesDir)
+                val runtimeSettings = repository.getRuntimeSettings()
+                val configJson = XrayConfigGenerator.generate(
+                    server,
+                    filesDir,
+                    runtimeSettings = runtimeSettings
+                )
                 val configFile = File(cacheDir, "xray_config.json")
                 try {
                     configFile.writeText(configJson)
@@ -349,8 +354,7 @@ class V2RayVpnService : VpnService() {
                 // into hev's YAML below (hever's tun mtu), otherwise the TUN
                 // layer and the tunnel engine disagree on packet sizing and
                 // large packets get dropped silently -> stalled transfers.
-                val mtu = repository.getRuntimeSettings().mtu
-                    .coerceIn(1280, 1500)
+                val mtu = runtimeSettings.mtu.coerceIn(1280, 1500)
                 repository.log("TUNNEL", "INFO", "Applying tunnel MTU: $mtu")
 
                 val builder = Builder()
@@ -364,16 +368,17 @@ class V2RayVpnService : VpnService() {
                     // hev-socks5-tunnel relays v6 over the same SOCKS loopback.
                     .addAddress("fdfe:dcba:9876::1", 126)
                     .addRoute("::", 0)
-                    // DNS servers offered to apps. Apps send UDP/53 to these
-                    // addresses; the packets enter TUN -> hev -> Xray's socks
-                    // inbound -> port-53 routing rule -> dns-out, which answers
-                    // from the reachable domestic Shecan resolvers. Both
-                    // advertised servers are Shecan (primary/secondary) so no
-                    // app query ever targets 1.1.1.1 directly on the physical
-                    // link (which is blocked in Iran).
-                    .addDnsServer("178.22.122.100")
-                    .addDnsServer("185.51.200.2")
                     .setMtu(mtu)
+
+                // Android sends app DNS queries to these VPN DNS addresses.
+                // Full-tunnel routes carry those packets into HEV and Xray;
+                // Xray's default routing rule then forwards them through proxy.
+                // Use numeric IPv4 addresses only, and share the same normalized
+                // resolver list with Xray's DNS routing rule. This prevents a
+                // malformed hostname from causing a system DNS lookup outside
+                // the tunnel and prevents resolver routing mismatches.
+                val dnsServers = runtimeSettings.effectiveDnsServers()
+                dnsServers.forEach { builder.addDnsServer(it) }
 
                 try {
                     builder.addDisallowedApplication(packageName)

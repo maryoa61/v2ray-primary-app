@@ -46,12 +46,7 @@ object XrayConfigGenerator {
     }
 
     const val SOCKS_INBOUND_PORT = 10808
-
-    // Iranian anti-sanction / domestic DNS resolvers (Shecan). Kept as
-    // constants because they must also be reachable DIRECTLY (not proxied),
-    // so they are injected into both the DNS config and the direct IP rules.
-    private const val IR_DNS_PRIMARY = "178.22.122.100"
-    private const val IR_DNS_SECONDARY = "185.51.200.2"
+    private const val HTTP_INBOUND_PORT = 10809
 
     // Xray-core has no "tun" inbound protocol — confirmed against the official
     // Xray-core source and infra/conf parser (unknown config / exit code 23 if
@@ -62,13 +57,24 @@ object XrayConfigGenerator {
     // the VPN/TUN layer at all.
     // (helpers str()/alpnArray() above produce the JSON strings used below.)
 
-    fun generate(server: ServerEntity, filesDir: File? = null): String {
+    fun generate(
+        server: ServerEntity,
+        filesDir: File? = null,
+        socksPort: Int = SOCKS_INBOUND_PORT,
+        httpPort: Int = HTTP_INBOUND_PORT,
+        runtimeSettings: RuntimeSettings = RuntimeSettings()
+    ): String {
         val outbounds = when (server.type.uppercase()) {
-            "VLESS" -> generateVlessOutbound(server)
-            "VMESS" -> generateVmessOutbound(server)
-            "TROJAN" -> generateTrojanOutbound(server)
-            "SHADOWSOCKS" -> generateShadowsocksOutbound(server)
+            "VLESS" -> generateVlessOutbound(server, runtimeSettings)
+            "VMESS" -> generateVmessOutbound(server, runtimeSettings)
+            "TROJAN" -> generateTrojanOutbound(server, runtimeSettings)
+            "SHADOWSOCKS" -> generateShadowsocksOutbound(server, runtimeSettings)
             else -> generateFreedomOutbound()
+        }
+        val fragmentOutboundJson = if (shouldUseFragment(server, runtimeSettings)) {
+            generateFragmentOutbound(server, runtimeSettings)
+        } else {
+            ""
         }
 
         // Safety verification: only append geoip strings if the geoip.dat file actually
@@ -83,32 +89,46 @@ object XrayConfigGenerator {
         // The regexp rules below already cover .ir domains without needing that category.
         val hasGeoip = filesDir != null && File(filesDir, "geoip.dat").exists()
 
-        // CRITICAL DNS FIX (learned from device logs in Iran):
-        // The xray process is EXCLUDED from the VPN (addDisallowedApplication),
-        // so every socket xray opens — including its own DNS queries — goes out
-        // on the PHYSICAL link. A public resolver like 1.1.1.1 / 8.8.8.8 is
-        // blocked on the Iranian physical link, so:
-        //   * resolving the PROXY SERVER's own domain (which can never go
-        //     through the tunnel — chicken-and-egg) timed out
-        //     ("dial tcp: lookup <server-domain>: operation was canceled"),
-        //   * and every foreign DNS query failed.
-        // Shecan (178.22.122.100 / 185.51.200.2) is a domestic resolver that
-        // IS reachable on the physical link and resolves BOTH .ir and foreign
-        // domains, so xray uses it for everything. Foreign-domain answers are
-        // harmless anyway: with sniffing + AsIs, proxied connections forward
-        // the sniffed DOMAIN to the remote server (which re-resolves), so the
-        // local answer is only used to reach the proxy and for DIRECT (.ir /
-        // private) traffic where Shecan is authoritative.
-        // The Shecan IPs are also pinned to the DIRECT routing rule below so
-        // xray's queries to them never try to enter the tunnel.
+        // App DNS packets stay ordinary port-53 flows and match the final proxy
+        // routing rule; they are not handed to dns-out and resolved on the
+        // physical network. Xray itself needs DNS only to bootstrap a
+        // domain-based proxy endpoint. Resolve that endpoint with direct DoH
+        // over TLS to a numeric resolver IP, avoiding plaintext DNS and a
+        // proxy/DNS circular dependency. Other Xray DNS lookups use routed DoH.
+        val bootstrapDnsServer = if (isIpLiteral(server.address)) {
+            null
+        } else {
+            """
+            {
+              "address": "https+local://1.1.1.1/dns-query",
+              "domains": [${str("full:${server.address}")}],
+              "skipFallback": true
+            }
+            """.trimIndent()
+        }
+        val dnsServers = listOfNotNull(
+            bootstrapDnsServer,
+            str("https://1.1.1.1/dns-query"),
+            str("https://1.0.0.1/dns-query")
+        ).joinToString(",\n")
         val dnsBlock = """
           "dns": {
             "queryStrategy": "UseIPv4",
-            "servers": [
-              "$IR_DNS_PRIMARY",
-              "$IR_DNS_SECONDARY"
-            ]
+            "servers": [$dnsServers]
           },
+        """.trimIndent()
+
+        // Keep every resolver advertised by VpnService on the proxy path,
+        // including private/LAN addresses. This rule must precede the private-IP
+        // direct rule below; otherwise a user-selected router DNS could escape
+        // through the physical network because Xray itself is VPN-excluded.
+        val dnsResolverIps = runtimeSettings.effectiveDnsServers().joinToString(",") { str(it) }
+        val dnsProxyRule = """
+          {
+            "type": "field",
+            "outboundTag": "proxy",
+            "ip": [$dnsResolverIps]
+          }
         """.trimIndent()
 
         // CRITICAL FIX: hev-socks5-tunnel hands Xray raw destination IPs for
@@ -124,26 +144,20 @@ object XrayConfigGenerator {
         // needed for HTTP/3 traffic (Google/YouTube over UDP/443); UDP is
         // already enabled on the inbound.
         //
-        // domainStrategy is "AsIs": direct traffic is resolved by the client
-        // (via the VPN-configured domestic DNS) and proxied traffic by the
-        // remote server. "IPIfNonMatch" forced an extra edge-side resolution
-        // for every connection, doubling DNS latency.
+        // domainStrategy is "AsIs": Xray does not initiate an extra IP-based
+        // DNS lookup just to route each connection. The app's resolver queries
+        // are routed through the proxy, while sniffing recovers hostnames so
+        // the .ir domain rule can select the direct outbound. "IPIfNonMatch"
+        // forced an extra resolution for unmatched connections.
         //
-        // The first rule sends all DNS (UDP/TCP 53) to the built-in dns-out:
-        // Xray answers the intercepted queries locally using the reachable
-        // Shecan resolvers defined in the dns block, and xray's own sockets to
-        // Shecan are routed DIRECT (explicit IP list below) because the xray
-        // process is excluded from the VPN.
+        // Do not route app port-53 traffic to dns-out: that would make Xray
+        // issue resolver requests outside the VPN app's own tunnel. TUN DNS
+        // flows instead remain ordinary SOCKS UDP/TCP traffic and use proxy.
         val routingRules = """
           "routing": {
             "domainStrategy": "AsIs",
             "rules": [
-              {
-                "type": "field",
-                "inboundTag": ["socks-in", "http-in"],
-                "outboundTag": "dns-out",
-                "port": 53
-              },
+              $dnsProxyRule,
               {
                 "type": "field",
                 "outboundTag": "direct",
@@ -161,8 +175,6 @@ object XrayConfigGenerator {
                   "192.168.0.0/16",
                   "127.0.0.0/8",
                   "100.64.0.0/10",
-                  "$IR_DNS_PRIMARY",
-                  "$IR_DNS_SECONDARY",
                   "fc00::/7",
                   "fe80::/10"
                   ${if (hasGeoip) ",\"geoip:private\",\"geoip:ir\"" else ""}
@@ -187,7 +199,7 @@ object XrayConfigGenerator {
           "inbounds": [
             {
               "tag": "socks-in",
-              "port": $SOCKS_INBOUND_PORT,
+              "port": $socksPort,
               "listen": "127.0.0.1",
               "protocol": "socks",
               "settings": {
@@ -201,7 +213,7 @@ object XrayConfigGenerator {
             },
             {
               "tag": "http-in",
-              "port": 10809,
+              "port": $httpPort,
               "listen": "127.0.0.1",
               "protocol": "http",
               "settings": {},
@@ -212,23 +224,27 @@ object XrayConfigGenerator {
             }
           ],
           "outbounds": [
-            $outbounds,
+            $outbounds${if (fragmentOutboundJson.isNotEmpty()) ",\n$fragmentOutboundJson" else ""},
             {
               "protocol": "freedom",
               "settings": {},
               "tag": "direct"
-            },
-            {
-              "protocol": "dns",
-              "tag": "dns-out"
             }
           ]
         }
         """.trimIndent()
     }
 
-    private fun generateVlessOutbound(server: ServerEntity): String {
-        val streamSettingsJson = generateStreamSettings(server)
+    private fun isIpLiteral(address: String): Boolean {
+        if (address.contains(':')) return true
+        val octets = address.split('.')
+        return octets.size == 4 && octets.all { octet ->
+            octet.toIntOrNull()?.let { it in 0..255 } == true
+        }
+    }
+
+    private fun generateVlessOutbound(server: ServerEntity, runtimeSettings: RuntimeSettings): String {
+        val streamSettingsJson = generateStreamSettings(server, runtimeSettings)
         // flow comes from the link as-is (v2rayNG behaviour). Auto-defaulting to
         // xtls-rprx-vision breaks servers whose REALITY expects no flow: the auth
         // fails silently and the server falls back to its real SNI target.
@@ -250,8 +266,8 @@ object XrayConfigGenerator {
         """
     }
 
-    private fun generateVmessOutbound(server: ServerEntity): String {
-        val streamSettingsJson = generateStreamSettings(server)
+    private fun generateVmessOutbound(server: ServerEntity, runtimeSettings: RuntimeSettings): String {
+        val streamSettingsJson = generateStreamSettings(server, runtimeSettings)
         return """
         {
           "protocol": "vmess",
@@ -268,8 +284,8 @@ object XrayConfigGenerator {
         """
     }
 
-    private fun generateTrojanOutbound(server: ServerEntity): String {
-        val streamSettingsJson = generateStreamSettings(server)
+    private fun generateTrojanOutbound(server: ServerEntity, runtimeSettings: RuntimeSettings): String {
+        val streamSettingsJson = generateStreamSettings(server, runtimeSettings)
         return """
         {
           "protocol": "trojan",
@@ -285,11 +301,11 @@ object XrayConfigGenerator {
         """
     }
 
-    private fun generateShadowsocksOutbound(server: ServerEntity): String {
+    private fun generateShadowsocksOutbound(server: ServerEntity, runtimeSettings: RuntimeSettings): String {
         val creds = server.uuid.split(":")
         val method = if (creds.isNotEmpty()) creds[0] else "aes-256-gcm"
         val password = if (creds.size > 1) creds[1] else "mypassword"
-        val streamSettingsJson = generateStreamSettings(server)
+        val streamSettingsJson = generateStreamSettings(server, runtimeSettings)
 
         return """
         {
@@ -317,7 +333,52 @@ object XrayConfigGenerator {
         """
     }
 
-    private fun generateStreamSettings(server: ServerEntity): String {
+    private fun shouldUseFragment(server: ServerEntity, runtimeSettings: RuntimeSettings): Boolean {
+        val supportedProtocol = server.type.uppercase() in setOf("VLESS", "VMESS", "TROJAN", "SHADOWSOCKS")
+        val hasTls = server.tls || server.security.equals("reality", ignoreCase = true)
+        return runtimeSettings.fragmentEnabled && supportedProtocol && hasTls
+    }
+
+    private fun generateFragmentOutbound(server: ServerEntity, runtimeSettings: RuntimeSettings): String {
+        val isReality = server.security.equals("reality", ignoreCase = true)
+        val requestedPackets = runtimeSettings.fragmentPackets.trim().lowercase()
+        val packets = when {
+            requestedPackets == "tlshello" && isReality -> "1-3"
+            requestedPackets == "tlshello" -> "tlshello"
+            requestedPackets.matches(Regex("\\d+-\\d+")) ->
+                normalizeRange(requestedPackets, fallback = "1-3", minValue = 1, maxValue = 100)
+            else -> "1-3"
+        }
+        val length = normalizeRange(runtimeSettings.fragmentLength, "50-100", 1, 65_535)
+        val interval = normalizeRange(runtimeSettings.fragmentInterval, "10-20", 0, 60_000)
+        val maxSplit = normalizeRange(runtimeSettings.fragmentMaxSplit, "10", 1, 1_024)
+
+        return """
+        {
+          "protocol": "freedom",
+          "settings": {
+            "fragment": {
+              "packets": ${str(packets)},
+              "length": ${str(length)},
+              "interval": ${str(interval)},
+              "maxSplit": ${str(maxSplit)}
+            }
+          },
+          "tag": "fragment"
+        }
+        """.trimIndent()
+    }
+
+    private fun normalizeRange(raw: String, fallback: String, minValue: Int, maxValue: Int): String {
+        val pieces = raw.trim().split('-')
+        if (pieces.size !in 1..2) return fallback
+        val from = pieces[0].trim().toIntOrNull() ?: return fallback
+        val to = if (pieces.size == 1) from else pieces[1].trim().toIntOrNull() ?: return fallback
+        if (from !in minValue..maxValue || to !in from..maxValue) return fallback
+        return if (pieces.size == 1) from.toString() else "$from-$to"
+    }
+
+    private fun generateStreamSettings(server: ServerEntity, runtimeSettings: RuntimeSettings): String {
         val isReality = server.security.lowercase() == "reality"
         val securityStr = when {
             isReality -> "reality"
@@ -413,6 +474,9 @@ object XrayConfigGenerator {
         val parts = mutableListOf<String>()
         if (securityConfig.isNotEmpty()) parts.add(securityConfig)
         if (transportConfig.isNotEmpty()) parts.add(transportConfig)
+        if (shouldUseFragment(server, runtimeSettings)) {
+            parts.add("\"sockopt\": {\"dialerProxy\": \"fragment\"}")
+        }
 
         return """
         {
