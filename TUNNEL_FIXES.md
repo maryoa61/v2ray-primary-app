@@ -26,8 +26,16 @@ over plaintext UDP/53 on the physical network. The Xray process is excluded
 from the VPN, so pinning those resolver IPs to `direct` exposed DNS queries
 outside the proxy.
 - Removed the port-53 → `dns-out` rule and the direct Shecan IP exceptions.
-  App DNS requests now remain normal UDP/TCP flows and match the final `proxy`
-  routing rule.
+  App DNS requests remain ordinary UDP/TCP flows (not `dns-out`). A new first
+  routing rule sends destination ports `53,853,784,8853` (plain DNS, DoT and
+  standard/common DoQ ports) to `proxy` before `.ir`, private-IP, or LAN direct
+  bypass rules. This also catches an app that chooses a resolver different
+  from the one shown in VPN settings, including a private or Iranian resolver.
+- Xray evaluates routing rules top-to-bottom and uses the first effective
+  match. The VPN app package itself is still excluded because its spawned Xray
+  process has no per-socket `VpnService.protect()` callback; routing those
+  upstream sockets back into its own TUN would loop. The app's own subscription
+  traffic is therefore outside this tunnel.
 - Xray's own resolver uses DoH. The proxy endpoint's hostname has a dedicated
   direct-DoH bootstrap match to avoid a proxy/DNS circular dependency; other
   Xray DNS lookups use routed DoH. The bootstrap uses Xray `https+local` and
@@ -41,6 +49,19 @@ outside the proxy.
   bypass rules, preventing a user-selected router DNS address from escaping to
   the physical network. Private LAN resolvers may consequently be unreachable
   from the remote proxy and should be replaced with a public resolver.
+- Generic DoH is HTTPS on port 443 and is indistinguishable from ordinary HTTPS
+  by port alone; it follows the regular destination routing rules (and can
+  still be sent direct if its provider destination matches a direct rule).
+  The direct bootstrap DoH is encrypted, but Cloudflare sees the proxy-hostname
+  lookup and the request leaves outside the tunnel. Enabling Android's
+  Always-on VPN with **Block connections without VPN** is required to prevent
+  ordinary app traffic from falling back to the physical network when the VPN
+  is stopped. No code-only review can promise zero DNS egress in every app, OS,
+  browser DoH configuration, network transition, or VPN-disconnected state.
+- References: [Xray routing rules](https://xtls.github.io/en/config/routing.html),
+  [Xray DNS server routing modes](https://xtls.github.io/en/config/dns.html),
+  [Android `VpnService.Builder`](https://developer.android.com/reference/android/net/VpnService.Builder),
+  and [Android per-app VPN behavior](https://developer.android.com/develop/connectivity/vpn).
 
 ## 3. Android 14+ crash on disconnect (`startForeground` contract)
 **File:** `service/V2RayVpnService.kt`
@@ -146,8 +167,9 @@ Android versions skip the runtime permission request.
 
 ## Tests added
 - `app/src/test/java/com/example/XrayConfigGeneratorTest.kt` — validates config
-  structure, sniffing enabled, proxied app DNS + encrypted bootstrap DoH,
-  resolver routing before private-network bypass and invalid DNS fallback,
+  structure, sniffing enabled, DNS transport ports routed through proxy before
+  `.ir`/private bypasses, encrypted bootstrap DoH, resolver routing before
+  private-network bypass and invalid DNS fallback,
   temporary ping-probe ports, `AsIs` strategy, geoip gating, hev MTU
   propagation/clamping/stack-size, and opt-in Fragment, user parameters,
   malformed-value fallback, and REALITY mapping.

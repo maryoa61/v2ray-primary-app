@@ -212,7 +212,7 @@ fun SettingsScreen(
             }
         }
         Text(
-            "App DNS queries use this numeric IPv4 resolver through the proxy tunnel. For domain-based proxy hosts, Xray bootstraps the server address separately with direct, encrypted Cloudflare DoH (1.1.1.1:443); this setting does not change that resolver, and it must be reachable before the tunnel starts. A private LAN resolver may not be reachable from the proxy server.",
+            "DNS on ports 53, 853, 784 and 8853 is routed through the proxy before direct-route rules. DoH on HTTPS/443 follows normal site routing and cannot be identified by port alone. For a domain-based proxy host, Xray uses direct but encrypted Cloudflare DoH (1.1.1.1:443) to bootstrap the tunnel; this exposes that one hostname to Cloudflare. The VPN app itself is excluded to prevent Xray's upstream sockets recursively entering the tunnel, so the app's own subscription traffic is not covered. Android's Always-on VPN + Block connections without VPN is needed to stop other apps falling back when disconnected. A private LAN resolver may not be reachable from the proxy server.",
             fontSize = 11.sp,
             color = SlateTextSecondary
         )

@@ -134,7 +134,7 @@ class V2RayVpnService : VpnService() {
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("V2Ray Dan Core Active")
-            .setContentText("Connected in real tunnel mode. Routing all apps traffic through gateway.")
+            .setContentText("Connected. Routing eligible apps through the gateway.")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -380,6 +380,11 @@ class V2RayVpnService : VpnService() {
                 val dnsServers = runtimeSettings.effectiveDnsServers()
                 dnsServers.forEach { builder.addDnsServer(it) }
 
+                // Xray is a child process in this app's UID. Without a socket-level
+                // VpnService.protect() callback for every Xray dial, routing this
+                // package into its own TUN would recursively capture the proxy's
+                // upstream sockets. Keep the client package excluded; its own
+                // subscription/bootstrap traffic is therefore outside this VPN.
                 try {
                     builder.addDisallowedApplication(packageName)
                     repository.log("TUNNEL", "INFO", "Bypassed package: $packageName")

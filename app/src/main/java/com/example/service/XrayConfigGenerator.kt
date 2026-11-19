@@ -89,10 +89,10 @@ object XrayConfigGenerator {
         // The regexp rules below already cover .ir domains without needing that category.
         val hasGeoip = filesDir != null && File(filesDir, "geoip.dat").exists()
 
-        // App DNS packets stay ordinary port-53 flows and match the final proxy
-        // routing rule; they are not handed to dns-out and resolved on the
-        // physical network. Xray itself needs DNS only to bootstrap a
-        // domain-based proxy endpoint. Resolve that endpoint with direct DoH
+        // App DNS packets stay ordinary port-53 flows and are explicitly routed
+        // through the proxy before any direct-bypass rule; they are not handed
+        // to dns-out and resolved on the physical network. Xray itself needs
+        // DNS to bootstrap a domain-based proxy endpoint. Resolve that endpoint with direct DoH
         // over TLS to a numeric resolver IP, avoiding plaintext DNS and a
         // proxy/DNS circular dependency. Other Xray DNS lookups use routed DoH.
         val bootstrapDnsServer = if (isIpLiteral(server.address)) {
@@ -118,10 +118,25 @@ object XrayConfigGenerator {
           },
         """.trimIndent()
 
+        // Route DNS transports through the proxy before any domain/IP bypass.
+        // Matching only the resolver configured in VpnService is insufficient:
+        // apps can send DNS to their own resolver, and a private or Iranian DNS
+        // address would otherwise match a direct-bypass rule. DoH on HTTPS/443
+        // is indistinguishable from ordinary HTTPS at the port level; it follows
+        // the normal domain/proxy routing policy below.
+        val dnsTransportProxyRule = """
+          {
+            "type": "field",
+            "outboundTag": "proxy",
+            "network": "tcp,udp",
+            "port": "53,853,784,8853"
+          }
+        """.trimIndent()
+
         // Keep every resolver advertised by VpnService on the proxy path,
-        // including private/LAN addresses. This rule must precede the private-IP
-        // direct rule below; otherwise a user-selected router DNS could escape
-        // through the physical network because Xray itself is VPN-excluded.
+        // including private/LAN addresses. Route all traffic to these exact
+        // resolver IPs through proxy even when its destination port is not a
+        // standard DNS port.
         val dnsResolverIps = runtimeSettings.effectiveDnsServers().joinToString(",") { str(it) }
         val dnsProxyRule = """
           {
@@ -152,11 +167,13 @@ object XrayConfigGenerator {
         //
         // Do not route app port-53 traffic to dns-out: that would make Xray
         // issue resolver requests outside the VPN app's own tunnel. TUN DNS
-        // flows instead remain ordinary SOCKS UDP/TCP traffic and use proxy.
+        // flows remain ordinary SOCKS UDP/TCP traffic, but the first routing
+        // rule forces standard DNS/DoT/DoQ ports through proxy before bypasses.
         val routingRules = """
           "routing": {
             "domainStrategy": "AsIs",
             "rules": [
+              $dnsTransportProxyRule,
               $dnsProxyRule,
               {
                 "type": "field",

@@ -13,7 +13,7 @@ import java.io.File
 
 /**
  * Pure-JVM tests for the Xray/hev config that guards the tunnel stability
- * fixes (sniffing, proxied app DNS, encrypted bootstrap DoH, MTU propagation).
+ * fixes (sniffing, DNS transport routing, encrypted bootstrap DoH, MTU propagation).
  *
  * These intentionally avoid org.json / Android so they run on the host JVM
  * with the plain unit-test runner.
@@ -215,7 +215,7 @@ class XrayConfigGeneratorTest {
     }
 
     @Test
-    fun `app DNS stays on proxy and proxy hostname bootstrap uses encrypted DoH`() {
+    fun `app DNS ports stay on proxy and proxy hostname bootstrap uses encrypted DoH`() {
         val json = XrayConfigGenerator.generate(sampleServer, filesDir = null)
         assertTrue("dns block present", json.contains("\"dns\""))
         assertTrue("bootstrap resolver uses encrypted direct DoH", json.contains("https+local://1.1.1.1/dns-query"))
@@ -225,8 +225,29 @@ class XrayConfigGeneratorTest {
         assertFalse("plain domestic DNS resolvers must not be configured", json.contains("178.22.122.100"))
         assertFalse("plain secondary DNS resolver must not be configured", json.contains("185.51.200.2"))
         assertFalse("app DNS must not be hijacked by dns-out", json.contains("dns-out"))
-        assertFalse("there must be no special port-53 direct/hijack rule", json.contains("\"port\": 53"))
-        assertTrue("all ordinary TCP/UDP flows, including DNS, use proxy", json.contains("\"network\": \"tcp,udp\""))
+        val dnsPortRule = json.indexOf("\"port\": \"53,853,784,8853\"")
+        val iranDirectRule = json.indexOf("\"regexp:\\\\.ir$\"")
+        val privateDirectRule = json.indexOf("\"10.0.0.0/8\"")
+        assertTrue("catch-all DNS transport rule exists", dnsPortRule >= 0)
+        assertTrue(
+            "DNS transport rule sends TCP and UDP through proxy",
+            Regex("""\{\s*"type": "field",\s*"outboundTag": "proxy",\s*"network": "tcp,udp",\s*"port": "53,853,784,8853"\s*}""")
+                .containsMatchIn(json)
+        )
+        assertTrue("DNS rule precedes .ir direct routing", dnsPortRule < iranDirectRule)
+        assertTrue("DNS rule precedes private/LAN direct routing", dnsPortRule < privateDirectRule)
+        assertTrue("all ordinary TCP/UDP flows use the proxy fallback", json.contains("\"network\": \"tcp,udp\""))
+    }
+
+    @Test
+    fun `unconfigured private or Iranian DNS endpoints cannot hit direct bypass rules`() {
+        val json = XrayConfigGenerator.generate(sampleServer, filesDir = null)
+        val dnsPortRule = json.indexOf("\"port\": \"53,853,784,8853\"")
+        val iranDirectRule = json.indexOf("\"regexp:\\\\.ir$\"")
+        val privateDirectRule = json.indexOf("\"10.0.0.0/8\"")
+        assertTrue("DNS rule matches standard DNS and encrypted DNS ports", dnsPortRule >= 0)
+        assertTrue("DNS rule is evaluated before Iranian direct rule", dnsPortRule < iranDirectRule)
+        assertTrue("DNS rule is evaluated before private-IP direct rule", dnsPortRule < privateDirectRule)
     }
 
     @Test
