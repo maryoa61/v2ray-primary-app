@@ -20,7 +20,9 @@ jobs:
           distribution: 'temurin'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4.0.4
+        with:
+          packages: platform-tools
 
       # ──────────────────────────────────────────────
       # مرحله ۱: پاک کردن تمام کش‌ها
